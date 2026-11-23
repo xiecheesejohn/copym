@@ -44,6 +44,15 @@ impl Shared {
                     let gs: Vec<_> = groups.iter().map(|g| GroupMatcher::new(g).ok()).collect();
                     Response::Counts(self.store.lock().unwrap().group_counts(&q, &gs))
                 }
+                Request::RedoOcr => {
+                    let Some(tx) = &self.ocr_tx else { return Err("图片文字识别未启用".into()) };
+                    let mut store = self.store.lock().unwrap();
+                    let n = store.reset_ocr()?;
+                    for id in store.pending_ocr() {
+                        let _ = tx.send(id);
+                    }
+                    Response::Counts(vec![Some(n as u32)])
+                }
                 Request::Get { id } => Response::Content(self.store.lock().unwrap().get(id)?),
                 Request::Thumb { id } => Response::Thumb(self.store.lock().unwrap().thumb(id)?),
                 Request::Activate { id } => {
@@ -308,6 +317,18 @@ pub fn run() -> Result<(), String> {
 
     // OCR worker: one low-priority thread, processes new images and backfills old ones.
     if let Some(ocr) = ocr {
+        {
+            // Results of an older pipeline: recognize everything again once.
+            let mut store = shared.store.lock().unwrap();
+            if store.info("ocr_rev").unwrap_or(1) < crate::ocr::REVISION {
+                match store.reset_ocr() {
+                    Ok(n) if n > 0 => eprintln!("copym: OCR improved - re-recognizing {n} images in the background"),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("copym: store error: {e}"),
+                }
+                let _ = store.set_info("ocr_rev", crate::ocr::REVISION);
+            }
+        }
         for id in shared.store.lock().unwrap().pending_ocr() {
             let _ = ocr_tx.send(id);
         }

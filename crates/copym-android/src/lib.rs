@@ -200,3 +200,78 @@ pub extern "system" fn Java_io_github_xiecheesejohn_copym_Native_join<'l>(mut en
 pub extern "system" fn Java_io_github_xiecheesejohn_copym_Native_leave<'l>(mut env: JNIEnv<'l>, _: JClass<'l>) {
     guard(&mut env, (), |_| app()?.leave())
 }
+
+// ---------------------------------------------------------------- groups --
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_xiecheesejohn_copym_Native_groups<'l>(mut env: JNIEnv<'l>, _: JClass<'l>) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let s = app()?.groups_json();
+        new_string(env, &s)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_xiecheesejohn_copym_Native_setGroups<'l>(mut env: JNIEnv<'l>, _: JClass<'l>, json: JString<'l>) {
+    guard(&mut env, (), |env| {
+        let j = get_string(env, &json)?;
+        app()?.set_groups(&j)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_xiecheesejohn_copym_Native_listGroup<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    query: JString<'l>,
+    regex: jboolean,
+    group: jint,
+    limit: jint,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let q = get_string(env, &query)?;
+        let json = app()?.list_group(&q, regex != JNI_FALSE, group, limit.max(1) as usize)?;
+        new_string(env, &json)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_xiecheesejohn_copym_Native_groupCounts<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    query: JString<'l>,
+    regex: jboolean,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let q = get_string(env, &query)?;
+        let json = app()?.group_counts(&q, regex != JNI_FALSE)?;
+        new_string(env, &json)
+    })
+}
+
+/// Count for one group of an unsaved draft; -1 = invalid rule.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_xiecheesejohn_copym_Native_draftCount<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    groups: JString<'l>,
+    index: jint,
+) -> jint {
+    let groups = match get_string(&mut env, &groups) {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    app()
+        .ok()
+        .and_then(|a| a.draft_count(&groups, index.max(0) as usize).ok().flatten())
+        .map(|n| n as jint)
+        .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_xiecheesejohn_copym_Native_detail<'l>(mut env: JNIEnv<'l>, _: JClass<'l>, id: jlong) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let s = app()?.detail(id as u64)?;
+        new_string(env, &s)
+    })
+}

@@ -38,6 +38,9 @@ COMMANDS:
     sync join CODE[@IP:PORT]  Join the devices of CODE (address optional)
     sync leave      Stop syncing and forget the group key
     groups          Open the group manager (groups.toml)
+    ocr FILE.png    Recognize the text in an image (shows the engine used)
+    ocr models      Download high-accuracy Tesseract models (Linux; Tesseract engine)
+    ocr redo        Recognize all stored images again
     autostart on|off  Start the daemon at login
     config          Print the config file path
     help            Show this help
@@ -59,6 +62,7 @@ fn main() {
         "daemon" => daemon::run(),
         "gui" => gui::run(args.get(1).map(String::as_str).unwrap_or("")),
         "groups" => gui::run("groups"),
+        "ocr" => ocr_cmd(&args[1..]),
         "show" | "toggle" => show(),
         "list" => list(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(20)),
         "search" => {
@@ -103,6 +107,37 @@ fn main() {
     if let Err(e) = result {
         eprintln!("copym: {e}");
         std::process::exit(1);
+    }
+}
+
+fn ocr_cmd(args: &[String]) -> Result<(), String> {
+    let cfg = config::Config::load();
+    match args.first().map(String::as_str) {
+        Some("models") => {
+            let langs = args.get(1).cloned().unwrap_or_else(|| cfg.ocr_languages.clone());
+            println!("下载 Tesseract 高精度模型（tessdata_best）：{langs}");
+            let dir = ocr::download_models(&langs)?;
+            println!("完成：{}\n重启守护进程后生效（copym quit && copym），然后运行 copym ocr redo 重新识别已有图片。", dir.display());
+            Ok(())
+        }
+        Some("redo") => match client()?.request(&Request::RedoOcr).map_err(|e| e.to_string())? {
+            Response::Counts(c) => {
+                println!("正在后台重新识别 {} 张图片", c.first().copied().flatten().unwrap_or(0));
+                Ok(())
+            }
+            Response::Err(e) => Err(e),
+            _ => Err("unexpected response".into()),
+        },
+        Some(path) => {
+            let o = ocr::Ocr::detect(&cfg).ok_or("没有可用的 OCR 引擎（Linux 需要安装 tesseract 和中文语言包）")?;
+            let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+            let t = std::time::Instant::now();
+            let text = o.recognize(&bytes)?;
+            eprintln!("[{} · {:.1}s]", o.name(), t.elapsed().as_secs_f32());
+            println!("{text}");
+            Ok(())
+        }
+        None => Err("用法：copym ocr FILE.png | copym ocr models [chi_sim+eng] | copym ocr redo".into()),
     }
 }
 

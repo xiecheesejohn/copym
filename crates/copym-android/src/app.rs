@@ -3,8 +3,10 @@
 //! tested on the host.
 
 use copym_core::imgutil;
-use copym_core::model::{now_secs, Content, Filter, ItemMeta, Kind};
-use copym_core::store::{Query, Store};
+use copym_core::groups::{self, Groups};
+use copym_core::kinds::{self, classify, TextKind};
+use copym_core::model::{now_secs, Content, Filter, GroupRule, ItemMeta, Kind};
+use copym_core::store::{GroupMatcher, Query, Store};
 use copym_sync::{Engine, ItemKind, SyncItem};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -21,6 +23,8 @@ pub type R<T> = Result<T, String>;
 
 pub struct App {
     store: Mutex<Store>,
+    groups: Mutex<Groups>,
+    groups_path: PathBuf,
     sync: OnceLock<Engine>,
     /// Bumped on every change so the UI can cheaply poll for updates.
     version: AtomicU64,
@@ -40,7 +44,15 @@ impl App {
         let dir = PathBuf::from(data_dir);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let store = Store::open(&dir.join("history.redb"), MAX_ITEMS)?;
-        let app = Arc::new(App { store: Mutex::new(store), sync: OnceLock::new(), version: AtomicU64::new(1) });
+        let groups_path = dir.join("groups.toml");
+        let groups = std::fs::read_to_string(&groups_path).ok().and_then(|s| groups::from_toml(&s).ok()).unwrap_or_default();
+        let app = Arc::new(App {
+            store: Mutex::new(store),
+            groups: Mutex::new(groups),
+            groups_path,
+            sync: OnceLock::new(),
+            version: AtomicU64::new(1),
+        });
         let cfg = copym_sync::Config {
             identity_path: dir.join("sync-identity.bin"),
             device_name: device_name.to_string(),
@@ -76,6 +88,83 @@ impl App {
         };
         let items: Vec<Value> = self.store.lock().unwrap().list(&q, filter, limit).iter().map(meta_json).collect();
         Ok(Value::Array(items).to_string())
+    }
+
+    // ------------------------------------------------------------ groups --
+
+    /// `{"default": name, "group": [{name, kind, pinned, patterns, apps, rest}, ...]}`
+    pub fn groups_json(&self) -> String {
+        serde_json::to_string(&*self.groups.lock().unwrap()).unwrap_or_default()
+    }
+
+    /// Replace all groups (validated) and persist them as groups.toml.
+    pub fn set_groups(&self, json: &str) -> R<()> {
+        let g: Groups = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        if g.list.is_empty() {
+            return Err("至少需要一个分组".into());
+        }
+        let mut names = std::collections::HashSet::new();
+        for d in &g.list {
+            d.validate().map_err(|e| format!("「{}」：{e}", d.name))?;
+            if !names.insert(d.name.trim().to_string()) {
+                return Err(format!("分组名称重复：{}", d.name));
+            }
+        }
+        let tmp = self.groups_path.with_extension("toml.tmp");
+        std::fs::write(&tmp, groups::to_toml(&g)?).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &self.groups_path).map_err(|e| e.to_string())?;
+        *self.groups.lock().unwrap() = g;
+        self.bump();
+        Ok(())
+    }
+
+    /// Items of group `index` (out of range = everything), with a `type` field.
+    pub fn list_group(&self, query: &str, regex: bool, index: i32, limit: usize) -> R<String> {
+        let q = Query::parse(query, regex)?;
+        let rule = usize::try_from(index).ok().map(|i| self.groups.lock().unwrap().rule(i)).filter(|r| *r != GroupRule::default());
+        let m = rule.as_ref().map(GroupMatcher::new).transpose()?;
+        let items: Vec<Value> = self.store.lock().unwrap().list_group(&q, m.as_ref(), limit).iter().map(meta_json).collect();
+        Ok(Value::Array(items).to_string())
+    }
+
+    /// Item count per group for the current search: `[n | null, ...]` (null = invalid rule).
+    pub fn group_counts(&self, query: &str, regex: bool) -> R<String> {
+        let q = Query::parse(query, regex)?;
+        let rules = self.groups.lock().unwrap().rules();
+        Ok(json!(self.count_rules(&q, &rules)).to_string())
+    }
+
+    /// Count for group `index` of an unsaved draft (the group editor).
+    pub fn draft_count(&self, groups_json: &str, index: usize) -> R<Option<u32>> {
+        let g: Groups = serde_json::from_str(groups_json).map_err(|e| e.to_string())?;
+        Ok(self.count_rules(&Query::All, &[g.rule(index)])[0])
+    }
+
+    fn count_rules(&self, q: &Query, rules: &[GroupRule]) -> Vec<Option<u32>> {
+        let ms: Vec<_> = rules.iter().map(|r| GroupMatcher::new(r).ok()).collect();
+        self.store.lock().unwrap().group_counts(q, &ms)
+    }
+
+    /// Full content prepared for the preview:
+    /// `{"type", "text"?, "pretty"?, "color"?: {"argb", "values": [[k, v]...]}}`.
+    pub fn detail(&self, id: u64) -> R<String> {
+        let Some(content) = self.store.lock().unwrap().get(id)? else { return Err("条目不存在".into()) };
+        Ok(match content {
+            Content::Image { width, height, .. } => json!({ "type": "image", "w": width, "h": height }),
+            Content::Text(t) => {
+                let kind = classify(&t, true);
+                let mut v = json!({ "type": kind.as_str(), "label": kind.label(), "text": t });
+                if kind == TextKind::Json {
+                    v["pretty"] = json!(kinds::pretty_json(&t));
+                }
+                if let Some(c) = kinds::parse_color(&t).filter(|_| kind == TextKind::Color) {
+                    let argb = (u32::from(c[3]) << 24) | (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
+                    v["color"] = json!({ "argb": argb, "values": kinds::color_notations(c).map(|(k, s)| json!([k, s])) });
+                }
+                v
+            }
+        }
+        .to_string())
     }
 
     pub fn text(&self, id: u64) -> R<Option<String>> {
@@ -206,7 +295,15 @@ impl App {
 }
 
 fn meta_json(m: &ItemMeta) -> Value {
+    let kind = if m.kind == Kind::Image { TextKind::Image } else { classify(&m.preview, false) };
+    let color = (kind == TextKind::Color)
+        .then(|| kinds::parse_color(&m.preview))
+        .flatten()
+        .map(|c| (u32::from(c[3]) << 24) | (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]));
     json!({
+        "type": kind.as_str(),
+        "label": kind.label(),
+        "color": color,
         "id": m.id,
         "kind": if m.kind == Kind::Image { "image" } else { "text" },
         "preview": m.preview,
@@ -325,6 +422,44 @@ mod tests {
         assert_eq!(app.list("", false, 0, 50).unwrap(), "[]");
         let st: Value = serde_json::from_str(&app.sync_status()).unwrap();
         assert_eq!(st["paired"], false);
+    }
+
+    #[test]
+    fn groups_and_types() {
+        let dir = tmp("groups");
+        let app = App::open(&dir, "test-phone", 0, "", false).unwrap();
+        app.add_text("https://example.com/x".into(), None).unwrap();
+        app.add_text("#10B981".into(), None).unwrap();
+        app.add_text("您的验证码是 482913".into(), Some("desk".into())).unwrap();
+        let g: Value = serde_json::from_str(&app.groups_json()).unwrap();
+        assert_eq!(g["group"][3]["name"], "链接");
+        let links: Value = serde_json::from_str(&app.list_group("", false, 3, 50).unwrap()).unwrap();
+        assert_eq!(links.as_array().unwrap().len(), 1);
+        assert_eq!(links[0]["type"], "url");
+        let all: Value = serde_json::from_str(&app.list_group("", false, 0, 50).unwrap()).unwrap();
+        assert_eq!(all[1]["type"], "color");
+        assert_eq!(all[1]["color"], 0xFF10B981u32);
+
+        let mut g: Value = g;
+        g["group"].as_array_mut().unwrap().push(json!({"name": "验证码", "patterns": ["验证码\\D*\\d{4,8}"]}));
+        g["default"] = json!("验证码");
+        app.set_groups(&g.to_string()).unwrap();
+        assert_eq!(app.draft_count(&g.to_string(), 5).unwrap(), Some(1));
+        let counts: Value = serde_json::from_str(&app.group_counts("", false).unwrap()).unwrap();
+        assert_eq!(counts, json!([3, 3, 0, 1, 0, 1]));
+        let mut bad = g.clone();
+        bad["group"][5]["patterns"] = json!(["("]);
+        assert!(app.set_groups(&bad.to_string()).is_err());
+        // persisted
+        drop(app);
+        let reopened = App::open(&dir, "test-phone", 0, "", false).unwrap();
+        let g2: Value = serde_json::from_str(&reopened.groups_json()).unwrap();
+        assert_eq!(g2["default"], "验证码");
+
+        let id = all[1]["id"].as_u64().unwrap();
+        let d: Value = serde_json::from_str(&reopened.detail(id).unwrap()).unwrap();
+        assert_eq!(d["type"], "color");
+        assert_eq!(d["color"]["values"][0][1], "#10B981");
     }
 
     #[test]

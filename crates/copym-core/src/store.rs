@@ -23,6 +23,8 @@ const BLOB: TableDefinition<u64, &[u8]> = TableDefinition::new("blob");
 const THUMB: TableDefinition<u64, &[u8]> = TableDefinition::new("thumb");
 const OCR: TableDefinition<u64, &str> = TableDefinition::new("ocr");
 const TOMB: TableDefinition<u64, i64> = TableDefinition::new("tomb");
+/// Small key/value settings of the store itself (e.g. the OCR pipeline revision).
+const INFO: TableDefinition<&str, u64> = TableDefinition::new("info");
 /// Deletions older than this are forgotten.
 const TOMB_TTL: i64 = 30 * 86_400;
 
@@ -200,6 +202,7 @@ impl Store {
             w.open_table(BLOB).map_err(e)?;
             w.open_table(THUMB).map_err(e)?;
             w.open_table(OCR).map_err(e)?;
+            w.open_table(INFO).map_err(e)?;
             {
                 // prune old tombstones
                 let mut t = w.open_table(TOMB).map_err(e)?;
@@ -468,6 +471,33 @@ impl Store {
         Ok(())
     }
 
+    /// Forget all OCR results so every image is recognized again (after the
+    /// OCR pipeline improved). Returns how many images will be redone.
+    pub fn reset_ocr(&mut self) -> R<usize> {
+        let w = self.db.begin_write().map_err(e)?;
+        w.delete_table(OCR).map_err(e)?;
+        w.open_table(OCR).map_err(e)?;
+        w.commit().map_err(e)?;
+        let mut n = 0;
+        for en in self.entries.iter_mut().filter(|en| en.meta.kind == Kind::Image) {
+            en.meta.ocr = None;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    pub fn info(&self, key: &str) -> Option<u64> {
+        let r = self.db.begin_read().ok()?;
+        let t = r.open_table(INFO).ok()?;
+        t.get(key).ok()?.map(|v| v.value())
+    }
+
+    pub fn set_info(&mut self, key: &str, value: u64) -> R<()> {
+        let w = self.db.begin_write().map_err(e)?;
+        w.open_table(INFO).map_err(e)?.insert(key, value).map_err(e)?;
+        w.commit().map_err(e)
+    }
+
     /// Delete one item. Returns the tombstone to propagate: (hash, deleted_at).
     pub fn delete(&mut self, id: u64) -> R<Vec<(u64, i64)>> {
         self.remove_ids(&[id])
@@ -711,8 +741,18 @@ mod tests {
         assert_eq!(s.list(&re(r"¥\d+\.\d{2}"), Filter::All, 10).len(), 1);
         drop(s);
         // OCR text persists
-        let s = Store::open(&p, 50).unwrap();
+        let mut s = Store::open(&p, 50).unwrap();
         assert_eq!(s.list(&q("发票"), Filter::All, 10).len(), 1);
+        // reset_ocr makes images pending again; info values persist
+        assert_eq!(s.info("ocr_rev"), None);
+        s.set_info("ocr_rev", 2).unwrap();
+        assert_eq!(s.reset_ocr().unwrap(), 1);
+        assert_eq!(s.pending_ocr().len(), 1);
+        assert_eq!(s.list(&q("发票"), Filter::All, 10).len(), 0);
+        drop(s);
+        let s = Store::open(&p, 50).unwrap();
+        assert_eq!(s.info("ocr_rev"), Some(2));
+        assert_eq!(s.pending_ocr().len(), 1);
         drop(s);
         let _ = std::fs::remove_file(&p);
     }

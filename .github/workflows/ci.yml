@@ -59,6 +59,17 @@ jobs:
           /tmp/copym-dmg/copym.app/Contents/MacOS/copym version
           codesign --verify --deep --strict /tmp/copym-dmg/copym.app
           hdiutil detach /tmp/copym-dmg
+      - name: Chinese OCR (Apple Vision)
+        if: runner.os == 'macOS'
+        run: |
+          out=$(target/${{ matrix.target }}/release/copym ocr tests/ocr-zh.png)
+          echo "$out"
+          echo "$out" | grep -q "验证码" && echo "$out" | grep -q "482913"
+      - name: OCR (Windows.Media.Ocr, informational)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: bash
+        run: target/${{ matrix.target }}/release/copym.exe ocr tests/ocr-zh.png
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}

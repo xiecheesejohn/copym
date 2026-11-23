@@ -14,6 +14,7 @@ use eframe::egui::{
     Layout, Margin, Modifiers, Pos2, Rect, RichText, Sense, Stroke, TextFormat, TextureHandle, TextureOptions,
     ViewportCommand, Vec2,
 };
+use copym_core::kinds::{self, classify, TextKind};
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -226,177 +227,8 @@ impl Palette {
 
 // ---------------------------------------------------------- content types --
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum TextKind {
-    Plain,
-    Url,
-    Email,
-    Path,
-    Color,
-    Json,
-    Code,
-    Image,
-}
-
-impl TextKind {
-    fn label(self) -> &'static str {
-        match self {
-            TextKind::Plain => "文本",
-            TextKind::Url => "链接",
-            TextKind::Email => "邮箱",
-            TextKind::Path => "路径",
-            TextKind::Color => "颜色",
-            TextKind::Json => "JSON",
-            TextKind::Code => "代码",
-            TextKind::Image => "图片",
-        }
-    }
-
-    fn glyph(self) -> &'static str {
-        match self {
-            TextKind::Plain => "Aa",
-            TextKind::Url => "↗",
-            TextKind::Email => "@",
-            TextKind::Path => "/",
-            TextKind::Color => "#",
-            TextKind::Json => "{ }",
-            TextKind::Code => "</>",
-            TextKind::Image => "▣",
-        }
-    }
-}
-
-/// Guess what a piece of text is. `complete` = the full text (JSON is then
-/// actually parsed); otherwise a cheap guess on the preview.
-fn classify(text: &str, complete: bool) -> TextKind {
-    let s = text.trim();
-    if s.is_empty() {
-        return TextKind::Plain;
-    }
-    let single = !s.contains('\n');
-    if single && parse_color(s).is_some() {
-        return TextKind::Color;
-    }
-    if single && !s.contains(char::is_whitespace) {
-        let l = s.to_ascii_lowercase();
-        if ["http://", "https://", "ftp://"].iter().any(|p| l.starts_with(p)) && l.len() > 8 {
-            return TextKind::Url;
-        }
-        if is_email(s) {
-            return TextKind::Email;
-        }
-    }
-    if single && looks_like_path(s) {
-        return TextKind::Path;
-    }
-    if looks_like_json(s) && (!complete || serde_json::from_str::<serde_json::Value>(s).is_ok()) {
-        return TextKind::Json;
-    }
-    if looks_like_code(s) {
-        return TextKind::Code;
-    }
-    TextKind::Plain
-}
-
-fn is_email(s: &str) -> bool {
-    let Some((user, host)) = s.split_once('@') else { return false };
-    !user.is_empty() && host.contains('.') && !host.starts_with('.') && !host.ends_with('.') && !host.contains('@') && s.len() < 256
-}
-
-fn looks_like_path(s: &str) -> bool {
-    if s.len() > 1024 || s.contains("  ") {
-        return false;
-    }
-    let b = s.as_bytes();
-    let unix = (s.starts_with('/') && !s.starts_with("//") && b.len() > 1 && !b[1].is_ascii_whitespace()) || s.starts_with("~/");
-    let windows = b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/');
-    unix || windows || s.starts_with("file://")
-}
-
-fn looks_like_json(s: &str) -> bool {
-    if !s.starts_with(['{', '[']) {
-        return false;
-    }
-    let rest = s[1..].trim_start(); // '{' / '[' are one byte
-    (s.starts_with('{') && (rest.starts_with('"') || rest.starts_with('}')))
-        || (s.starts_with('[') && rest.starts_with(['{', '[', '"', ']', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9']))
-}
-
-fn looks_like_code(s: &str) -> bool {
-    const HINTS: [&str; 16] = [
-        "=>", "->", "::", "fn ", "def ", "function ", "class ", "import ", "#include", "return ", "const ", "let ", "var ",
-        "</", "public ", "func ",
-    ];
-    let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
-    let score = lines
-        .iter()
-        .filter(|l| {
-            let t = l.trim_end();
-            t.ends_with(';')
-                || t.ends_with('{')
-                || t.trim_start().starts_with('}')
-                || l.starts_with("    ")
-                || l.starts_with('\t')
-                || HINTS.iter().any(|h| t.contains(h))
-        })
-        .count();
-    if lines.len() >= 2 {
-        score * 2 >= lines.len()
-    } else {
-        let t = s.trim_end();
-        t.len() < 300 && (t.ends_with(';') && t.contains('(') || t.contains("=>") || t.starts_with("$ ") || t.starts_with("sudo "))
-    }
-}
-
-fn parse_color(s: &str) -> Option<Color32> {
-    let s = s.trim();
-    if let Some(h) = s.strip_prefix('#') {
-        if !h.chars().all(|c| c.is_ascii_hexdigit()) {
-            return None;
-        }
-        let v = |i: usize, n: usize| u8::from_str_radix(&h[i..i + n], 16).ok();
-        return match h.len() {
-            3 => Some(Color32::from_rgb(v(0, 1)? * 17, v(1, 1)? * 17, v(2, 1)? * 17)),
-            6 => Some(Color32::from_rgb(v(0, 2)?, v(2, 2)?, v(4, 2)?)),
-            8 => Some(Color32::from_rgba_unmultiplied(v(0, 2)?, v(2, 2)?, v(4, 2)?, v(6, 2)?)),
-            _ => None,
-        };
-    }
-    let l = s.to_ascii_lowercase();
-    let inner = l.strip_prefix("rgba(").or_else(|| l.strip_prefix("rgb("))?.strip_suffix(')')?;
-    let parts: Vec<&str> = inner.split([',', ' ', '/']).filter(|p| !p.is_empty()).collect();
-    if !(3..=4).contains(&parts.len()) {
-        return None;
-    }
-    let c = |p: &str| p.parse::<f32>().ok().filter(|v| (0.0..=255.0).contains(v)).map(|v| v.round() as u8);
-    let a = match parts.get(3) {
-        Some(p) => {
-            let v = p.trim_end_matches('%').parse::<f32>().ok()?;
-            if p.ends_with('%') { (v * 2.55).round() as u8 } else if v <= 1.0 { (v * 255.0).round() as u8 } else { v as u8 }
-        }
-        None => 255,
-    };
-    Some(Color32::from_rgba_unmultiplied(c(parts[0])?, c(parts[1])?, c(parts[2])?, a))
-}
-
-fn hsl(c: Color32) -> (u32, u32, u32) {
-    let [r, g, b, _] = c.to_srgba_unmultiplied().map(|v| v as f32 / 255.0);
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let l = (max + min) / 2.0;
-    if max == min {
-        return (0, 0, (l * 100.0).round() as u32);
-    }
-    let d = max - min;
-    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
-    let h = if max == r {
-        (g - b) / d + if g < b { 6.0 } else { 0.0 }
-    } else if max == g {
-        (b - r) / d + 2.0
-    } else {
-        (r - g) / d + 4.0
-    };
-    ((h * 60.0).round() as u32 % 360, (s * 100.0).round() as u32, (l * 100.0).round() as u32)
+fn color32(c: [u8; 4]) -> Color32 {
+    Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
 }
 
 /// Prepared content of the selected item for the preview pane.
@@ -641,10 +473,7 @@ impl App {
                 Some(Response::Content(Some(Content::Text(t)))) => {
                     let kind = classify(&t, true);
                     let body = match kind {
-                        TextKind::Json => serde_json::from_str::<serde_json::Value>(t.trim())
-                            .ok()
-                            .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                            .unwrap_or(t),
+                        TextKind::Json => kinds::pretty_json(&t).unwrap_or(t),
                         _ => t,
                     };
                     Detail::Text { kind, body }
@@ -714,11 +543,19 @@ impl App {
         let mut toggle_regex = false;
         let page = ((self.view_height / (ROW_H + ROW_GAP)).floor() as isize).max(1);
         ctx.input_mut(|i| {
-            if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
-                nav = 1;
+            // Down / up: arrows, Vim (Ctrl+J / Ctrl+K) and Emacs (Ctrl+N / Ctrl+P).
+            // Plain Ctrl - on macOS ⌘ stays free for the app's own shortcuts.
+            for k in [Key::ArrowDown, Key::J, Key::N] {
+                let m = if k == Key::ArrowDown { Modifiers::NONE } else { Modifiers::CTRL };
+                if i.consume_key(m, k) {
+                    nav = 1;
+                }
             }
-            if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
-                nav = -1;
+            for k in [Key::ArrowUp, Key::K, Key::P] {
+                let m = if k == Key::ArrowUp { Modifiers::NONE } else { Modifiers::CTRL };
+                if i.consume_key(m, k) {
+                    nav = -1;
+                }
             }
             if i.consume_key(Modifiers::NONE, Key::PageDown) {
                 nav = page;
@@ -729,17 +566,18 @@ impl App {
             if i.consume_key(Modifiers::NONE, Key::Enter) {
                 action = Some(Action::Activate(self.selected));
             }
-            if i.consume_key(Modifiers::COMMAND, Key::P) {
+            if i.consume_key(Modifiers::COMMAND, Key::S) {
                 action = Some(Action::Pin(self.selected));
             }
             if i.consume_key(Modifiers::SHIFT, Key::Delete) || i.consume_key(Modifiers::COMMAND, Key::D) {
                 action = Some(Action::Delete(self.selected));
             }
-            if i.consume_key(Modifiers::NONE, Key::Tab) {
-                cycle = 1;
-            }
+            // Shift+Tab first: matching ignores extra Shift.
             if i.consume_key(Modifiers::SHIFT, Key::Tab) {
                 cycle = -1;
+            }
+            if i.consume_key(Modifiers::NONE, Key::Tab) {
+                cycle = 1;
             }
             if i.consume_key(Modifiers::COMMAND, Key::R) || i.consume_key(Modifiers::ALT, Key::R) {
                 toggle_regex = true;
@@ -1085,7 +923,7 @@ impl App {
         }
         let p = ui.painter();
         if kind == TextKind::Color {
-            if let Some(c) = parse_color(&meta.preview) {
+            if let Some(c) = kinds::parse_color(&meta.preview).map(color32) {
                 p.rect_filled(tile, 8, c);
                 p.rect_stroke(tile, 8, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
                 return;
@@ -1485,7 +1323,7 @@ impl App {
                                 .hint_text(r"例：^\s*https?://"),
                         )
                         .changed();
-                    ui.label(RichText::new("来源应用正则（每行一条，可留空）").size(12.0).color(pal.dim));
+                    ui.label(RichText::new("来源正则：来源应用或同步设备名（每行一条，可留空）").size(12.0).color(pal.dim));
                     changed |= ui
                         .add(
                             egui::TextEdit::multiline(&mut ed.apps)
@@ -1576,12 +1414,15 @@ impl App {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
             let enter = if cfg!(target_os = "macos") { "⏎" } else { "Enter" };
+            #[cfg(target_os = "macos")]
+            let nav_keys = "↑↓ ⌃J/K ⌃N/P";
+            #[cfg(not(target_os = "macos"))]
+            let nav_keys = "↑↓ Ctrl+J/K/N/P";
             for (k, label) in [
-                ("↑↓", "选择"),
+                (nav_keys, "选择"),
                 (enter, "粘贴"),
                 (&format!("{KEY_GROUP}1-9") as &str, "分组"),
                 (&format!("{KEY_PASTE}1-9") as &str, "快速粘贴"),
-                ("Esc", "关闭"),
             ] {
                 keycap(ui, pal, k);
                 ui.label(RichText::new(label).size(11.0).color(pal.faint));
@@ -1781,22 +1622,16 @@ fn paint_checker(p: &egui::Painter, r: Rect, pal: &Palette) {
 }
 
 fn color_preview(ui: &mut egui::Ui, pal: &Palette, text: &str) {
-    let Some(c) = parse_color(text) else { return };
+    let Some(rgba) = kinds::parse_color(text) else { return };
+    let c = color32(rgba);
     let w = ui.available_width();
     let (r, _) = ui.allocate_exact_size(Vec2::new(w, (ui.available_height() * 0.5).clamp(80.0, 180.0)), Sense::hover());
     paint_checker(ui.painter(), r, pal);
     ui.painter().rect_filled(r, 10, c);
     ui.painter().rect_stroke(r, 10, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
     ui.add_space(10.0);
-    let [cr, cg, cb, ca] = c.to_srgba_unmultiplied();
-    let (h, s, l) = hsl(c);
-    let rows = [
-        ("HEX", if ca == 255 { format!("#{cr:02X}{cg:02X}{cb:02X}") } else { format!("#{cr:02X}{cg:02X}{cb:02X}{ca:02X}") }),
-        ("RGB", if ca == 255 { format!("rgb({cr}, {cg}, {cb})") } else { format!("rgba({cr}, {cg}, {cb}, {:.2})", ca as f32 / 255.0) }),
-        ("HSL", format!("hsl({h}, {s}%, {l}%)")),
-    ];
     egui::Grid::new("color-values").num_columns(2).spacing([14.0, 6.0]).show(ui, |ui| {
-        for (k, v) in rows {
+        for (k, v) in kinds::color_notations(rgba) {
             ui.label(RichText::new(k).size(11.5).color(pal.faint));
             ui.add(egui::Label::new(RichText::new(v).font(FontId::monospace(13.0)).color(pal.text)).selectable(true));
             ui.end_row();
@@ -1888,27 +1723,5 @@ fn human_size(b: u64) -> String {
         format!("{:.1} KB", f / K)
     } else {
         format!("{:.1} MB", f / K / K)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn content_types() {
-        assert_eq!(classify("https://example.com/a?b=1", true), TextKind::Url);
-        assert_eq!(classify("  #3D5AFE ", true), TextKind::Color);
-        assert_eq!(classify("rgba(10, 20, 30, 0.5)", true), TextKind::Color);
-        assert_eq!(classify("me@example.com", true), TextKind::Email);
-        assert_eq!(classify("/home/me/file.txt", true), TextKind::Path);
-        assert_eq!(classify(r"C:\Users\me", true), TextKind::Path);
-        assert_eq!(classify(r#"{"a": [1, 2]}"#, true), TextKind::Json);
-        assert_eq!(classify(r#"{"a": "#, true), TextKind::Plain); // broken JSON
-        assert_eq!(classify("fn main() {\n    println!(\"hi\");\n}", true), TextKind::Code);
-        assert_eq!(classify("今天天气不错\n我们去公园吧", true), TextKind::Plain);
-        assert_eq!(classify("#hashtag", true), TextKind::Plain);
-        assert_eq!(parse_color("#fff"), Some(Color32::WHITE));
-        assert_eq!(hsl(Color32::from_rgb(255, 0, 0)), (0, 100, 50));
     }
 }

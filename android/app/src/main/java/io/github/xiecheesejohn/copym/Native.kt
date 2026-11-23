@@ -26,4 +26,14 @@ object Native {
     @JvmStatic external fun pairStart(): String
     @JvmStatic external fun join(code: String): String
     @JvmStatic external fun leave()
+
+    // groups (same model and groups.toml format as the desktop app)
+    @JvmStatic external fun groups(): String
+    @JvmStatic external fun setGroups(json: String)
+    @JvmStatic external fun listGroup(query: String, regex: Boolean, group: Int, limit: Int): String
+    @JvmStatic external fun groupCounts(query: String, regex: Boolean): String
+    /** Items an unsaved draft group would contain; -1 = invalid rule. */
+    @JvmStatic external fun draftCount(groupsJson: String, index: Int): Int
+    /** Full content prepared for the preview (type, text, pretty JSON, color values). */
+    @JvmStatic external fun detail(id: Long): String
 }

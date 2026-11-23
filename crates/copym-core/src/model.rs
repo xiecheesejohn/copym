@@ -115,6 +115,8 @@ pub enum Request {
     ListGroup { query: String, regex: bool, group: Option<GroupRule>, limit: u32 },
     /// Number of items in each group for the current search; `None` = invalid rule.
     GroupCounts { query: String, regex: bool, groups: Vec<GroupRule> },
+    /// Forget all OCR results and recognize every image again.
+    RedoOcr,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
