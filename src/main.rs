@@ -1,19 +1,18 @@
 // No console window on Windows (CLI commands re-attach to the parent console).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+use copym_core::{imgutil, model, store};
+
 mod autostart;
 mod clip;
 mod config;
 mod daemon;
 mod filter;
 mod gui;
-mod imgutil;
 mod ipc;
 #[cfg(target_os = "linux")]
 mod kde_hotkey;
-mod model;
 mod ocr;
-mod store;
 
 use model::{Filter, Kind, Request, Response};
 

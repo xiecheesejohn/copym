@@ -1,6 +1,6 @@
 # copym
 
-用 Rust 编写的现代化、高性能、跨平台（Linux / Windows / macOS）剪贴板管理器。
+用 Rust 编写的现代化、高性能、跨平台（Linux / Windows / macOS，另有安卓端）剪贴板管理器。
 
 - **低占用**：常驻的只有一个约 7 MB 内存、空闲 0% CPU 的守护进程；界面是按需启动的独立进程，关闭即退出。
 - **原生监听**：Wayland `ext-data-control` / `wlr-data-control`，X11 XFixes，Windows `AddClipboardFormatListener`，macOS `NSPasteboard.changeCount`。
@@ -88,7 +88,7 @@ copym delete ID         # 删除（已配对设备上同步删除）
 | 同步规则 | 按内容哈希去重；收到的条目保留原始复制时间、标注来源设备、只进历史；删除会同步（固定项除外）；本机的忽略规则同样作用于收到的内容；密码类内容本来就不会记录，因此也不会被同步 |
 | 防火墙 | 需要放行 TCP 47800（`sync_port`）和 UDP 5353（mDNS）。Fedora Workstation 默认已放行；Windows 首次运行会弹出防火墙提示 |
 
-同步核心是独立的纯 Rust 库 `crates/copym-sync`（不依赖桌面代码和任何 C 库，已通过 `aarch64-linux-android` 编译检查），以后安卓端可以直接复用。
+同步核心是独立的纯 Rust 库 `crates/copym-sync`（不依赖桌面代码和任何 C 库），桌面端和安卓端共用同一份代码，协议完全兼容。
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
@@ -98,6 +98,31 @@ copym delete ID         # 删除（已配对设备上同步删除）
 | `sync_images` / `sync_max_image_bytes` | true / 8 MB | 是否同步图片及大小上限 |
 | `sync_history_items` | 200 | 重新连接时互相对比的最近条目数 |
 | `sync_peers` | [] | mDNS 不可用时手动指定的 `IP:端口` |
+
+## 安卓端
+
+`android/` 是原生安卓 App（Kotlin + Jetpack Compose，Material 3 动态取色，Android 8.0+）。历史存储和同步直接复用桌面端的 Rust 代码（`crates/copym-core` + `crates/copym-sync`，通过 JNI 调用），APK 约 8 MB。
+
+**系统限制**：Android 10 起系统禁止后台应用读取剪贴板，所以手机端不能像电脑那样自动记录每一次复制。copym 的做法：
+
+| 方向 | 方式 |
+|---|---|
+| 电脑 → 手机 | 配对后，电脑上的复制自动同步进手机的历史；点一下条目即复制到手机剪贴板 |
+| 手机 → 历史 / 电脑 | ① 复制后打开 copym，自动保存当前剪贴板 ② 任意 App 中“分享 → 保存到 copym”（文字、图片）③ 通知栏快捷开关“保存剪贴板” |
+| 隐私 | 带有系统敏感标记（`EXTRA_IS_SENSITIVE`，密码管理器会设置）的内容不保存；同步组密钥不参与系统备份 |
+
+其他功能：搜索 / 正则搜索、全部 / 文字 / 图片 / 固定 筛选、长按固定 / 分享 / 删除、清空历史、配对码配对（生成或加入）、手动地址（Wi-Fi 屏蔽 mDNS 时用），以及可选的“后台保持同步”（前台服务；Android 15 起系统限制每天 6 小时）。
+
+构建（需要 Android SDK 35、NDK r27c、JDK 17+、Rust 安卓目标和 `cargo-ndk`）：
+
+```sh
+rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+cargo install cargo-ndk
+cd android && ./gradlew assembleRelease   # Gradle 会先调用 cargo-ndk 编译 Rust 库
+# 产物：android/app/build/outputs/apk/release/app-release.apk
+```
+
+未设置 `COPYM_KEYSTORE` 等签名环境变量时，release 包使用本机 debug 密钥签名，适合自用；不同机器打出的包签名不同，不能互相覆盖安装。
 
 ## 测试
 
@@ -115,18 +140,19 @@ src/
   main.rs          CLI 入口
   daemon.rs        守护进程：监听 → 过滤 → 存储；IPC 服务；全局快捷键；弹窗进程管理
   clip/            各平台剪贴板后端（wayland/ x11 windows macos + arboard 读写）
-  store.rs         redb 持久化 + 内存索引（文本常驻内存用于搜索，图片只存磁盘）
   ipc.rs           本地 socket（Unix 0700 目录 / Windows 命名管道）+ postcard 帧
   gui.rs           egui 弹窗
   filter.rs        应用 / 正则 / 大小过滤
-  imgutil.rs       PNG 编解码与缩略图
   ocr.rs           图片文字识别（Vision / Windows.Media.Ocr / Tesseract）
   kde_hotkey.rs    KDE 全局快捷键（KGlobalAccel D-Bus）
-crates/copym-sync/ 局域网加密同步核心（平台无关，可复用于安卓）
+crates/copym-core/ 桌面与安卓共用：历史存储（redb + 内存索引）、数据模型、PNG 工具
+crates/copym-sync/ 局域网加密同步核心（平台无关）
   channel.rs       Noise 加密通道与分帧
   identity.rs      设备 ID / 组密钥持久化
   protocol.rs      同步消息
   lib.rs           发现、连接管理、配对、同步引擎
+crates/copym-android/ 安卓 JNI 库（app.rs 业务逻辑 + lib.rs JNI 导出）
+android/           安卓 App（Kotlin + Compose）
 ```
 
 ## 许可证

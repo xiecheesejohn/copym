@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">copym</string>
+    <string name="share_label">保存到 copym</string>
+    <string name="tile_label">保存剪贴板</string>
+</resources>
