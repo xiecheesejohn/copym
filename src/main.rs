@@ -8,6 +8,7 @@ mod clip;
 mod config;
 mod daemon;
 mod filter;
+mod groups;
 mod gui;
 mod ipc;
 #[cfg(target_os = "linux")]
@@ -36,17 +37,19 @@ COMMANDS:
     sync pair       Show a one-time code to add another device (valid 3 min)
     sync join CODE[@IP:PORT]  Join the devices of CODE (address optional)
     sync leave      Stop syncing and forget the group key
+    groups          Open the group manager (groups.toml)
     autostart on|off  Start the daemon at login
     config          Print the config file path
     help            Show this help
 ";
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Older macOS versions pass "-psn_…" when an .app is opened from Finder.
+    let args: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("-psn_")).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("show");
 
     #[cfg(windows)]
-    if !matches!(cmd, "daemon" | "gui" | "show") {
+    if !matches!(cmd, "daemon" | "gui" | "groups" | "show") {
         unsafe {
             windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
         }
@@ -54,7 +57,8 @@ fn main() {
 
     let result = match cmd {
         "daemon" => daemon::run(),
-        "gui" => gui::run(args.get(1).is_some_and(|a| a == "sync")),
+        "gui" => gui::run(args.get(1).map(String::as_str).unwrap_or("")),
+        "groups" => gui::run("groups"),
         "show" | "toggle" => show(),
         "list" => list(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(20)),
         "search" => {

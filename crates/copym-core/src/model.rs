@@ -69,6 +69,23 @@ pub enum Filter {
     Pinned,
 }
 
+/// Rules of a history group (a saved filter). Every set condition must hold.
+/// Regexes run against the item's text (or the text recognized in an image).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupRule {
+    /// `None` = text and images.
+    pub kind: Option<Kind>,
+    /// Only pinned items.
+    pub pinned: bool,
+    /// At least one must match (empty = no constraint).
+    pub patterns: Vec<String>,
+    /// Source application must match at least one (empty = no constraint).
+    pub apps: Vec<String>,
+    /// None of these may match the content / the source app ("other" groups).
+    pub exclude: Vec<String>,
+    pub exclude_apps: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     /// `regex`: treat `query` as a (case-insensitive) regular expression.
@@ -94,6 +111,10 @@ pub enum Request {
     /// Join another device's group. `addr` ("ip:port") skips mDNS discovery.
     SyncJoin { code: String, addr: Option<String> },
     SyncLeave,
+    /// List the items of a group (`None` = everything).
+    ListGroup { query: String, regex: bool, group: Option<GroupRule>, limit: u32 },
+    /// Number of items in each group for the current search; `None` = invalid rule.
+    GroupCounts { query: String, regex: bool, groups: Vec<GroupRule> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -118,6 +139,7 @@ pub enum Response {
     Sync(SyncInfo),
     Pairing { code: String, addrs: Vec<String>, expires_secs: u64 },
     Joined { name: String },
+    Counts(Vec<Option<u32>>),
     Ok,
     Err(String),
 }

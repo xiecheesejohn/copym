@@ -6,7 +6,7 @@ use crate::filter::Filters;
 use crate::ipc;
 use crate::model::{Content, Request, Response};
 use crate::ocr::Ocr;
-use crate::store::{Query, Store};
+use crate::store::{GroupMatcher, Query, Store};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -33,6 +33,16 @@ impl Shared {
                 Request::List { query, filter, regex, limit } => {
                     let q = Query::parse(&query, regex)?;
                     Response::Items(self.store.lock().unwrap().list(&q, filter, limit as usize))
+                }
+                Request::ListGroup { query, regex, group, limit } => {
+                    let q = Query::parse(&query, regex)?;
+                    let g = group.as_ref().map(GroupMatcher::new).transpose()?;
+                    Response::Items(self.store.lock().unwrap().list_group(&q, g.as_ref(), limit as usize))
+                }
+                Request::GroupCounts { query, regex, groups } => {
+                    let q = Query::parse(&query, regex)?;
+                    let gs: Vec<_> = groups.iter().map(|g| GroupMatcher::new(g).ok()).collect();
+                    Response::Counts(self.store.lock().unwrap().group_counts(&q, &gs))
                 }
                 Request::Get { id } => Response::Content(self.store.lock().unwrap().get(id)?),
                 Request::Thumb { id } => Response::Thumb(self.store.lock().unwrap().thumb(id)?),

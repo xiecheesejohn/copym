@@ -13,7 +13,7 @@
 //! search; image payloads stay on disk.
 
 use crate::imgutil;
-use crate::model::{now_secs, Content, Filter, ItemMeta, Kind};
+use crate::model::{now_secs, Content, Filter, GroupRule, ItemMeta, Kind};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -129,6 +129,48 @@ impl Query {
             Query::Terms(terms) => terms.iter().all(|t| contains_ci(hay, t) || contains_ci(src, t)),
             Query::Regex(re) => re.is_match(hay) || re.is_match(src),
         }
+    }
+}
+
+/// A compiled [`GroupRule`].
+pub struct GroupMatcher {
+    kind: Option<Kind>,
+    pinned: bool,
+    patterns: Vec<regex_lite::Regex>,
+    apps: Vec<regex_lite::Regex>,
+    exclude: Vec<regex_lite::Regex>,
+    exclude_apps: Vec<regex_lite::Regex>,
+}
+
+impl GroupMatcher {
+    pub fn new(rule: &GroupRule) -> Result<Self, String> {
+        let compile = |list: &[String]| -> Result<Vec<regex_lite::Regex>, String> {
+            list.iter()
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| regex_lite::Regex::new(p).map_err(|e| format!("分组规则 {p:?} 无效：{e}")))
+                .collect()
+        };
+        Ok(Self {
+            kind: rule.kind,
+            pinned: rule.pinned,
+            patterns: compile(&rule.patterns)?,
+            apps: compile(&rule.apps)?,
+            exclude: compile(&rule.exclude)?,
+            exclude_apps: compile(&rule.exclude_apps)?,
+        })
+    }
+
+    fn matches(&self, en: &Entry) -> bool {
+        if self.kind.is_some_and(|k| k != en.meta.kind) || (self.pinned && !en.meta.pinned) {
+            return false;
+        }
+        let hay = en.haystack();
+        let src = en.meta.source.as_deref().unwrap_or("");
+        let any = |rs: &[regex_lite::Regex], s: &str| rs.iter().any(|r| r.is_match(s));
+        (self.patterns.is_empty() || any(&self.patterns, hay))
+            && (self.apps.is_empty() || any(&self.apps, src))
+            && !any(&self.exclude, hay)
+            && !(!src.is_empty() && any(&self.exclude_apps, src))
     }
 }
 
@@ -326,19 +368,42 @@ impl Store {
     }
 
     pub fn list(&self, query: &Query, filter: Filter, limit: usize) -> Vec<ItemMeta> {
+        self.list_where(query, limit, |en| match filter {
+            Filter::All => true,
+            Filter::Text => en.meta.kind == Kind::Text,
+            Filter::Image => en.meta.kind == Kind::Image,
+            Filter::Pinned => en.meta.pinned,
+        })
+    }
+
+    /// Items of a group (`None` = all), pinned first, newest first.
+    pub fn list_group(&self, query: &Query, group: Option<&GroupMatcher>, limit: usize) -> Vec<ItemMeta> {
+        self.list_where(query, limit, |en| group.is_none_or(|g| g.matches(en)))
+    }
+
+    /// How many items of each group match the search.
+    pub fn group_counts(&self, query: &Query, groups: &[Option<GroupMatcher>]) -> Vec<Option<u32>> {
+        let mut counts: Vec<Option<u32>> = groups.iter().map(|g| g.as_ref().map(|_| 0)).collect();
+        for en in self.entries.iter().filter(|en| query.matches(en)) {
+            for (g, c) in groups.iter().zip(counts.iter_mut()) {
+                if let (Some(g), Some(c)) = (g, c) {
+                    if g.matches(en) {
+                        *c += 1;
+                    }
+                }
+            }
+        }
+        counts
+    }
+
+    fn list_where(&self, query: &Query, limit: usize, keep: impl Fn(&Entry) -> bool) -> Vec<ItemMeta> {
         let mut pinned = Vec::new();
         let mut rest = Vec::new();
         for en in self.entries.iter().rev() {
             if pinned.len() + rest.len() >= limit {
                 break;
             }
-            let kind_ok = match filter {
-                Filter::All => true,
-                Filter::Text => en.meta.kind == Kind::Text,
-                Filter::Image => en.meta.kind == Kind::Image,
-                Filter::Pinned => en.meta.pinned,
-            };
-            if kind_ok && query.matches(en) {
+            if keep(en) && query.matches(en) {
                 let mut m = en.meta.clone();
                 if let Some(o) = &mut m.ocr {
                     if o.len() > OCR_VIEW_CHARS {
@@ -576,6 +641,47 @@ mod tests {
         let s = Store::open(&p, 3).unwrap();
         assert_eq!(s.len(), 4);
         assert_eq!(s.list(&q("中"), Filter::All, 10).len(), 0);
+        drop(s);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn groups_by_rules() {
+        let p = tmp("groups");
+        let mut s = Store::open(&p, 50).unwrap();
+        s.insert(Content::Text("https://example.com/a".into()), Some("Firefox".into())).unwrap();
+        s.insert(Content::Text("fn main() {}".into()), Some("Code".into())).unwrap();
+        let code = s.insert(Content::Text("SELECT 1;".into()), None).unwrap();
+        s.toggle_pin(code).unwrap();
+        let png = imgutil::encode_png(2, 2, &[255; 16]).unwrap();
+        s.insert(Content::Image { png, width: 2, height: 2 }, None).unwrap();
+
+        let rule = |f: &dyn Fn(&mut GroupRule)| {
+            let mut r = GroupRule::default();
+            f(&mut r);
+            GroupMatcher::new(&r).unwrap()
+        };
+        let link = rule(&|r| r.patterns = vec![r"^\s*https?://".into()]);
+        let from_code = rule(&|r| r.apps = vec!["(?i)^code$".into()]);
+        let images = rule(&|r| r.kind = Some(Kind::Image));
+        let pinned = rule(&|r| r.pinned = true);
+        let other = rule(&|r| {
+            r.kind = Some(Kind::Text);
+            r.exclude = vec![r"^\s*https?://".into()];
+            r.exclude_apps = vec!["(?i)^code$".into()];
+        });
+        let names = |g: &GroupMatcher| -> Vec<String> { s.list_group(&q(""), Some(g), 10).into_iter().map(|m| m.preview).collect() };
+        assert_eq!(names(&link), ["https://example.com/a"]);
+        assert_eq!(names(&from_code), ["fn main() {}"]);
+        assert_eq!(s.list_group(&q(""), Some(&images), 10).len(), 1);
+        assert_eq!(names(&pinned), ["SELECT 1;"]);
+        assert_eq!(names(&other), ["SELECT 1;"]);
+        assert_eq!(s.list_group(&q(""), None, 10).len(), 4);
+
+        let groups = vec![Some(link), Some(images), None];
+        assert_eq!(s.group_counts(&q(""), &groups), vec![Some(1), Some(1), None]);
+        assert_eq!(s.group_counts(&q("example"), &groups), vec![Some(1), Some(0), None]);
+        assert!(GroupMatcher::new(&GroupRule { patterns: vec!["(".into()], ..Default::default() }).is_err());
         drop(s);
         let _ = std::fs::remove_file(&p);
     }

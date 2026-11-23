@@ -36,13 +36,29 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev
       - run: cargo test --workspace
       - run: cargo build --release --target ${{ matrix.target }}
-      - name: Package (binary name carries OS and architecture)
+      - name: Package (file name carries OS and architecture)
         shell: bash
         run: |
           mkdir dist
-          ext=""; [ "${{ runner.os }}" = Windows ] && ext=".exe"
-          cp "target/${{ matrix.target }}/release/copym$ext" "dist/${{ matrix.name }}$ext"
-          file "dist/${{ matrix.name }}$ext" || true
+          bin="target/${{ matrix.target }}/release/copym"
+          if [ "${{ runner.os }}" = macOS ]; then
+            version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+            packaging/macos/make-dmg.sh "$bin" "$version" "dist/${{ matrix.name }}.dmg"
+          elif [ "${{ runner.os }}" = Windows ]; then
+            cp "$bin.exe" "dist/${{ matrix.name }}.exe"
+          else
+            cp "$bin" "dist/${{ matrix.name }}"
+          fi
+          ls -l dist
+      - name: Check the DMG
+        if: runner.os == 'macOS'
+        run: |
+          hdiutil attach -nobrowse -readonly -mountpoint /tmp/copym-dmg dist/*.dmg
+          ls -la /tmp/copym-dmg
+          file /tmp/copym-dmg/copym.app/Contents/MacOS/copym
+          /tmp/copym-dmg/copym.app/Contents/MacOS/copym version
+          codesign --verify --deep --strict /tmp/copym-dmg/copym.app
+          hdiutil detach /tmp/copym-dmg
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}

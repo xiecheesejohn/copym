@@ -6,6 +6,23 @@ pub fn set(enabled: bool) -> Result<String, String> {
     imp(enabled, &exe)
 }
 
+/// Whether copym is currently set to start at login.
+pub fn is_enabled() -> bool {
+    #[cfg(target_os = "linux")]
+    return dirs::config_dir().is_some_and(|d| d.join("autostart/copym.desktop").exists());
+    #[cfg(target_os = "macos")]
+    return dirs::home_dir().is_some_and(|d| d.join("Library/LaunchAgents/io.github.copym.plist").exists());
+    #[cfg(windows)]
+    return std::process::Command::new("reg")
+        .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "copym"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    #[allow(unreachable_code)]
+    false
+}
+
 #[cfg(target_os = "linux")]
 fn imp(enabled: bool, exe: &str) -> Result<String, String> {
     let dir = dirs::config_dir().ok_or("no config dir")?.join("autostart");
