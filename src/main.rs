@@ -28,6 +28,7 @@ COMMANDS:
     list [N]        Print the latest N items (default 20)
     select ID       Put item ID back on the clipboard
     delete ID       Delete item ID (also on synced devices)
+    pin ID          Pin / unpin item ID
     search [-r] Q   Search text and text inside images (-r: regular expression)
     pause | resume  Stop / restart recording
     clear           Remove all non-pinned items
@@ -73,6 +74,10 @@ fn main() {
         "delete" | "rm" => match args.get(1).and_then(|n| n.parse().ok()) {
             Some(id) => simple(Request::Delete { id }),
             None => Err("usage: copym delete ID".into()),
+        },
+        "pin" | "unpin" => match args.get(1).and_then(|n| n.parse().ok()) {
+            Some(id) => simple(Request::TogglePin { id }),
+            None => Err("usage: copym pin ID".into()),
         },
         "select" => match args.get(1).and_then(|n| n.parse().ok()) {
             Some(id) => simple(Request::Activate { id }),

@@ -19,8 +19,10 @@ use std::collections::HashMap;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-const ROW_H: f32 = 52.0;
-const ROW_GAP: f32 = 2.0;
+const ROW_H: f32 = 40.0;
+const SECTION_H: f32 = 30.0;
+const SEARCH_H: f32 = 56.0;
+const FOOTER_H: f32 = 40.0;
 const LIST_LIMIT: u32 = 1000;
 const PREVIEW_MAX_SIDE: u32 = 2048;
 
@@ -29,11 +31,12 @@ const KEY_GROUP: &str = "⌘";
 #[cfg(not(target_os = "macos"))]
 const KEY_GROUP: &str = "Ctrl+";
 #[cfg(target_os = "macos")]
-const KEY_PASTE: &str = "⌥";
+const KEY_ACTIONS: &str = "⌘K";
 #[cfg(not(target_os = "macos"))]
-const KEY_PASTE: &str = "Alt+";
+const KEY_ACTIONS: &str = "Alt+K";
 
-/// `open`: "" (normal), "sync" (sync dialog) or "groups" (group manager).
+/// `open`: "" (normal), "sync" (sync dialog), "groups" (group manager) or
+/// "actions" (action panel).
 pub fn run(open: &str) -> Result<(), String> {
     let open = open.to_string();
     let cfg = Config::load();
@@ -41,7 +44,7 @@ pub fn run(open: &str) -> Result<(), String> {
         viewport: egui::ViewportBuilder::default()
             .with_title("copym")
             .with_app_id("copym")
-            .with_inner_size([760.0, 470.0])
+            .with_inner_size([760.0, 480.0])
             .with_min_inner_size([560.0, 340.0])
             .with_decorations(false)
             .with_transparent(true)
@@ -81,6 +84,9 @@ pub fn run(open: &str) -> Result<(), String> {
             });
             let mut app = App::new(cfg);
             app.sync_open = open == "sync";
+            if open == "actions" {
+                app.actions = Some(0);
+            }
             if open == "groups" {
                 app.editor = Some(Editor::new(&app.groups, app.group));
             }
@@ -172,35 +178,37 @@ struct Palette {
 }
 
 impl Palette {
+    /// Raycast-like: neutral grays, translucent white/black overlays for
+    /// hover and selection, accent only for small highlights.
     fn new(dark: bool) -> Self {
         if dark {
             Self {
-                bg: Color32::from_rgba_unmultiplied(24, 24, 28, 250),
-                surface: Color32::from_rgb(33, 33, 39),
-                hover: Color32::from_rgb(40, 40, 48),
-                selected: Color32::from_rgb(45, 47, 74),
-                accent: Color32::from_rgb(140, 150, 255),
-                on_accent: Color32::from_rgb(18, 18, 30),
-                border: Color32::from_rgba_unmultiplied(255, 255, 255, 20),
-                text: Color32::from_rgb(236, 236, 241),
-                dim: Color32::from_rgb(160, 161, 175),
-                faint: Color32::from_rgb(108, 110, 124),
-                danger: Color32::from_rgb(255, 125, 125),
-                ok: Color32::from_rgb(92, 205, 140),
+                bg: Color32::from_rgba_unmultiplied(30, 30, 33, 250),
+                surface: Color32::from_rgb(40, 40, 44),
+                hover: Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+                selected: Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+                accent: Color32::from_rgb(255, 99, 99),
+                on_accent: Color32::WHITE,
+                border: Color32::from_rgba_unmultiplied(255, 255, 255, 22),
+                text: Color32::from_rgb(238, 238, 240),
+                dim: Color32::from_rgb(160, 160, 166),
+                faint: Color32::from_rgb(112, 112, 120),
+                danger: Color32::from_rgb(255, 110, 110),
+                ok: Color32::from_rgb(90, 205, 135),
                 dark,
             }
         } else {
             Self {
-                bg: Color32::from_rgba_unmultiplied(251, 251, 253, 252),
+                bg: Color32::from_rgba_unmultiplied(251, 251, 252, 252),
                 surface: Color32::WHITE,
-                hover: Color32::from_rgb(241, 242, 246),
-                selected: Color32::from_rgb(232, 234, 255),
-                accent: Color32::from_rgb(79, 70, 229),
+                hover: Color32::from_rgba_unmultiplied(0, 0, 0, 10),
+                selected: Color32::from_rgba_unmultiplied(0, 0, 0, 20),
+                accent: Color32::from_rgb(232, 64, 64),
                 on_accent: Color32::WHITE,
-                border: Color32::from_rgba_unmultiplied(0, 0, 0, 22),
-                text: Color32::from_rgb(24, 24, 27),
-                dim: Color32::from_rgb(100, 100, 112),
-                faint: Color32::from_rgb(158, 158, 170),
+                border: Color32::from_rgba_unmultiplied(0, 0, 0, 24),
+                text: Color32::from_rgb(28, 28, 30),
+                dim: Color32::from_rgb(100, 100, 108),
+                faint: Color32::from_rgb(150, 150, 158),
                 danger: Color32::from_rgb(210, 50, 50),
                 ok: Color32::from_rgb(22, 150, 80),
                 dark,
@@ -274,7 +282,42 @@ struct App {
     sync_pairing: Option<(String, Vec<String>)>,
     sync_job: Option<mpsc::Receiver<Result<String, String>>>,
     editor: Option<Editor>,
+    /// Rows of the list (sections + items) with their y offsets.
+    lines: Vec<(f32, Line)>,
+    item_y: Vec<f32>,
+    list_height: f32,
+    /// Action panel (⌘K) open, with the selected action.
+    actions: Option<usize>,
+    /// "复制到剪贴板" clicked in the action bar.
+    pending_copy: bool,
+    /// Local time zone offset in seconds.
+    tz: i64,
     frames: u64,
+}
+
+#[derive(Clone, Copy)]
+enum Line {
+    Section(&'static str),
+    Item(usize),
+}
+
+#[derive(Clone)]
+enum Act {
+    Copy,
+    Pin,
+    OpenUrl(String),
+    OpenPath(String),
+    Delete,
+    Pause,
+    Sync,
+    Groups,
+    Autostart,
+    Settings,
+}
+
+enum PanelRow {
+    Title(String),
+    Act(Act, String, String),
 }
 
 /// State of the "manage groups" dialog.
@@ -368,6 +411,12 @@ impl App {
             sync_pairing: None,
             sync_job: None,
             editor: None,
+            lines: Vec::new(),
+            item_y: Vec::new(),
+            list_height: 0.0,
+            actions: None,
+            pending_copy: false,
+            tz: local_offset(),
             frames: 0,
         };
         app.connect();
@@ -423,6 +472,7 @@ impl App {
                 self.items = items;
                 self.selected = self.selected.min(self.items.len().saturating_sub(1));
                 self.scroll_to_selected = true;
+                self.layout_list();
             }
             // An invalid regex is a search problem, not a connection problem.
             _ if self.client.is_some() => {
@@ -441,6 +491,38 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Split the list into sections: pinned, today, yesterday, this week, older.
+    fn layout_list(&mut self) {
+        let today = (now_secs() + self.tz).div_euclid(86_400);
+        let mut lines = Vec::with_capacity(self.items.len() + 5);
+        let mut item_y = Vec::with_capacity(self.items.len());
+        let mut y = 4.0;
+        let mut last = "";
+        for (i, m) in self.items.iter().enumerate() {
+            let sec = if m.pinned {
+                "已固定"
+            } else {
+                match today - (m.created + self.tz).div_euclid(86_400) {
+                    ..=0 => "今天",
+                    1 => "昨天",
+                    2..=6 => "本周",
+                    _ => "更早",
+                }
+            };
+            if sec != last {
+                lines.push((y, Line::Section(sec)));
+                y += SECTION_H;
+                last = sec;
+            }
+            lines.push((y, Line::Item(i)));
+            item_y.push(y);
+            y += ROW_H;
+        }
+        self.lines = lines;
+        self.item_y = item_y;
+        self.list_height = y + 6.0;
     }
 
     fn set_group(&mut self, i: usize) {
@@ -535,14 +617,27 @@ impl App {
         if self.sync_open || self.editor.is_some() {
             return None; // dialogs own the keyboard
         }
+        if self.actions.is_some() {
+            return self.panel_keys(ctx);
+        }
         let mut action = None;
         let mut close = false;
         let mut nav = 0isize;
         let mut cycle = 0isize;
         let mut group = None;
         let mut toggle_regex = false;
-        let page = ((self.view_height / (ROW_H + ROW_GAP)).floor() as isize).max(1);
+        let mut open_actions = false;
+        let page = ((self.view_height / ROW_H).floor() as isize).max(1);
         ctx.input_mut(|i| {
+            // Action panel: ⌘K on macOS, Alt+K elsewhere (Ctrl+K is Vim "up").
+            #[cfg(target_os = "macos")]
+            let actions_key = i.consume_key(Modifiers::COMMAND, Key::K);
+            #[cfg(not(target_os = "macos"))]
+            let actions_key = i.consume_key(Modifiers::ALT, Key::K);
+            if actions_key {
+                open_actions = true;
+                i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
+            }
             // Down / up: arrows, Vim (Ctrl+J / Ctrl+K) and Emacs (Ctrl+N / Ctrl+P).
             // Plain Ctrl - on macOS ⌘ stays free for the app's own shortcuts.
             for k in [Key::ArrowDown, Key::J, Key::N] {
@@ -601,6 +696,9 @@ impl App {
                 close = true;
             }
         });
+        if open_actions {
+            self.actions = Some(0);
+        }
         if nav != 0 {
             self.move_selection(nav);
         }
@@ -626,150 +724,232 @@ impl App {
         action
     }
 
-    // ------------------------------------------------------------- views --
-
-    fn header(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 38.0), Layout::right_to_left(Align::Center), |ui| {
-            self.menu(ui, pal, 34.0);
-            let outer_w = ui.available_width();
-            let frame = egui::Frame::new()
-                .fill(pal.surface)
-                .corner_radius(10)
-                .stroke(Stroke::new(1.0, if self.search_error.is_some() { pal.danger } else { pal.border }))
-                .inner_margin(Margin { left: 34, right: 5, top: 5, bottom: 5 });
-            let resp = frame.show(ui, |ui| {
-                ui.set_width(outer_w - 34.0 - 5.0 - 2.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let on = self.regex;
-                    let b = ui
-                        .add(
-                            egui::Button::new(RichText::new(".*").monospace().size(12.5).color(if on { pal.on_accent } else { pal.dim }))
-                                .fill(if on { pal.accent } else { Color32::TRANSPARENT })
-                                .corner_radius(6)
-                                .stroke(Stroke::NONE)
-                                .min_size(Vec2::new(30.0, 24.0)),
-                        )
-                        .on_hover_text(format!("正则表达式搜索 ({KEY_GROUP}R)"));
-                    if b.clicked() {
-                        self.regex = !self.regex;
-                        self.dirty = true;
+    /// Rows of the action panel for the selected item.
+    fn panel_rows(&self) -> Vec<PanelRow> {
+        let mut rows = Vec::new();
+        let cmd = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" };
+        let enter = if cfg!(target_os = "macos") { "⏎" } else { "Enter" };
+        if let Some(m) = self.items.get(self.selected) {
+            let title = match m.kind {
+                Kind::Text => one_line(&m.preview),
+                Kind::Image => format!("图片 {}×{}", m.width, m.height),
+            };
+            rows.push(PanelRow::Title(title));
+            rows.push(PanelRow::Act(Act::Copy, "复制到剪贴板".into(), enter.into()));
+            if let Some((id, Detail::Text { kind, body })) = &self.detail {
+                if *id == m.id {
+                    match kind {
+                        TextKind::Url => rows.push(PanelRow::Act(Act::OpenUrl(body.trim().into()), "在浏览器中打开".into(), String::new())),
+                        TextKind::Path => rows.push(PanelRow::Act(Act::OpenPath(body.trim().into()), "在文件管理器中打开".into(), String::new())),
+                        _ => {}
                     }
-                    let edit = egui::TextEdit::singleline(&mut self.query)
-                        .hint_text(if self.regex { "正则，例如 \\d{6} 或 ^https?://" } else { "搜索文本和图片中的文字" })
-                        .desired_width(ui.available_width())
-                        .font(FontId::proportional(15.0))
-                        .frame(egui::Frame::NONE)
-                        .margin(Margin::symmetric(0, 3));
-                    let r = ui.add(edit);
-                    if r.changed() {
-                        self.selected = 0;
-                        self.dirty = true;
-                    }
-                    if !self.sync_open && self.editor.is_none() {
-                        r.request_focus();
-                    }
-                });
-            });
-            // magnifier icon
-            let r = resp.response.rect;
-            let c = Pos2::new(r.left() + 18.0, r.center().y - 1.0);
-            let p = ui.painter();
-            p.circle_stroke(c, 5.5, Stroke::new(1.6, pal.faint));
-            p.line_segment([c + Vec2::new(4.0, 4.0), c + Vec2::new(8.0, 8.0)], Stroke::new(1.8, pal.faint));
-        });
-    }
-
-    fn menu(&mut self, ui: &mut egui::Ui, pal: &Palette, w: f32) {
-        let btn = egui::Button::new(RichText::new("•••").size(11.0).color(pal.dim))
-            .fill(Color32::TRANSPARENT)
-            .stroke(Stroke::NONE)
-            .min_size(Vec2::new(w, 34.0));
-        let resp = ui.add(btn).on_hover_text("菜单");
-        egui::Popup::menu(&resp).show(|ui| {
-            ui.set_min_width(170.0);
-            let pause = if self.paused { "继续记录剪贴板" } else { "暂停记录剪贴板" };
-            if ui.button(pause).clicked() {
-                if let Some(Response::Status { paused, .. }) = self.req(&Request::SetPaused(None)) {
-                    self.paused = paused;
                 }
             }
-            if ui.button("局域网同步…").clicked() {
+            rows.push(PanelRow::Act(Act::Pin, if m.pinned { "取消固定" } else { "固定" }.into(), format!("{cmd}S")));
+            rows.push(PanelRow::Act(Act::Delete, "删除".into(), format!("{cmd}D")));
+        }
+        rows.push(PanelRow::Title("copym".into()));
+        rows.push(PanelRow::Act(Act::Pause, if self.paused { "继续记录剪贴板" } else { "暂停记录剪贴板" }.into(), String::new()));
+        rows.push(PanelRow::Act(Act::Sync, "局域网同步…".into(), String::new()));
+        rows.push(PanelRow::Act(Act::Groups, "管理分组…".into(), String::new()));
+        rows.push(PanelRow::Act(Act::Autostart, if self.autostart { "关闭登录时自动启动" } else { "登录时自动启动" }.into(), String::new()));
+        rows.push(PanelRow::Act(Act::Settings, "打开设置文件".into(), String::new()));
+        rows
+    }
+
+    fn panel_acts(&self) -> Vec<Act> {
+        self.panel_rows().into_iter().filter_map(|r| if let PanelRow::Act(a, ..) = r { Some(a) } else { None }).collect()
+    }
+
+    fn panel_keys(&mut self, ctx: &egui::Context) -> Option<Action> {
+        let n = self.panel_acts().len();
+        let mut sel = self.actions.unwrap_or(0);
+        let mut run = false;
+        let mut close = false;
+        ctx.input_mut(|i| {
+            for (k, m, d) in [
+                (Key::ArrowDown, Modifiers::NONE, 1isize),
+                (Key::J, Modifiers::CTRL, 1),
+                (Key::N, Modifiers::CTRL, 1),
+                (Key::ArrowUp, Modifiers::NONE, -1),
+                (Key::K, Modifiers::CTRL, -1),
+                (Key::P, Modifiers::CTRL, -1),
+            ] {
+                if i.consume_key(m, k) {
+                    sel = (sel as isize + d).rem_euclid(n.max(1) as isize) as usize;
+                }
+            }
+            if i.consume_key(Modifiers::NONE, Key::Enter) {
+                run = true;
+            }
+            #[cfg(target_os = "macos")]
+            let toggle = i.consume_key(Modifiers::COMMAND, Key::K);
+            #[cfg(not(target_os = "macos"))]
+            let toggle = i.consume_key(Modifiers::ALT, Key::K);
+            if toggle || i.consume_key(Modifiers::NONE, Key::Escape) {
+                close = true;
+            }
+            i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
+        });
+        self.actions = Some(sel);
+        if close {
+            self.actions = None;
+        }
+        if run {
+            let act = self.panel_acts().get(sel).cloned();
+            self.actions = None;
+            return act.and_then(|a| self.run_act(ctx, a));
+        }
+        None
+    }
+
+    fn run_act(&mut self, _ctx: &egui::Context, act: Act) -> Option<Action> {
+        match act {
+            Act::Copy => return Some(Action::Activate(self.selected)),
+            Act::Pin => return Some(Action::Pin(self.selected)),
+            Act::Delete => return Some(Action::Delete(self.selected)),
+            Act::OpenUrl(u) => open_external(&u),
+            Act::OpenPath(p) => {
+                let path = std::path::Path::new(p.trim_start_matches("file://"));
+                let dir = if path.is_dir() { Some(path) } else { path.parent().filter(|d| d.is_dir()) };
+                match dir {
+                    Some(d) => open_external(&d.to_string_lossy()),
+                    None => self.notify("本机上不存在这个路径"),
+                }
+            }
+            Act::Pause => {
+                if let Some(Response::Status { paused, .. }) = self.req(&Request::SetPaused(None)) {
+                    self.paused = paused;
+                    self.notify(if paused { "已暂停记录" } else { "继续记录" });
+                }
+            }
+            Act::Sync => {
                 self.sync_open = true;
                 self.sync_msg = None;
                 self.refresh_sync();
             }
-            if ui.button("管理分组…").clicked() {
-                self.editor = Some(Editor::new(&self.groups, self.group));
-            }
-            ui.separator();
-            let mut auto = self.autostart;
-            if ui.checkbox(&mut auto, "登录时自动启动").changed() {
-                match crate::autostart::set(auto) {
-                    Ok(_) => self.autostart = auto,
-                    Err(e) => self.notify(format!("设置自启失败：{e}")),
+            Act::Groups => self.editor = Some(Editor::new(&self.groups, self.group)),
+            Act::Autostart => match crate::autostart::set(!self.autostart) {
+                Ok(_) => {
+                    self.autostart = !self.autostart;
+                    self.notify(if self.autostart { "已设为登录时自动启动" } else { "已关闭登录时自动启动" });
                 }
-            }
-            if ui.button("打开分组配置文件").clicked() {
-                open_external(&groups::path().to_string_lossy());
-            }
-            if ui.button("打开设置文件").clicked() {
-                open_external(&crate::config::config_path().to_string_lossy());
-            }
-        });
+                Err(e) => self.notify(format!("设置失败：{e}")),
+            },
+            Act::Settings => open_external(&crate::config::config_path().to_string_lossy()),
+        }
+        None
     }
 
-    fn group_bar(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        let mut clicked = None;
+    // ------------------------------------------------------------- views --
+
+    /// Big borderless search field, regex toggle and group dropdown, with a
+    /// full-width hairline below (Raycast style).
+    fn header(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), SEARCH_H), Sense::hover());
+        let inner = Rect::from_min_max(Pos2::new(rect.left() + 46.0, rect.top()), Pos2::new(rect.right() - 12.0, rect.bottom()));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner).layout(Layout::right_to_left(Align::Center)), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            self.group_dropdown(ui, pal);
+            let on = self.regex;
+            let b = ui
+                .add(
+                    egui::Button::new(RichText::new(".*").monospace().size(12.5).color(if on { pal.text } else { pal.faint }))
+                        .fill(if on { pal.selected } else { Color32::TRANSPARENT })
+                        .stroke(Stroke::NONE)
+                        .corner_radius(6)
+                        .min_size(Vec2::new(30.0, 26.0)),
+                )
+                .on_hover_text(format!("正则表达式搜索 ({KEY_GROUP}R)"));
+            if b.clicked() {
+                self.regex = !self.regex;
+                self.dirty = true;
+            }
+            let hint = if self.regex { "正则，例如 \\d{6} 或 ^https?://" } else { "搜索剪贴板历史…" };
+            let edit = egui::TextEdit::singleline(&mut self.query)
+                .hint_text(RichText::new(hint).color(pal.faint))
+                .desired_width(ui.available_width())
+                .font(FontId::proportional(17.0))
+                .text_color(pal.text)
+                .frame(egui::Frame::NONE)
+                .margin(Margin::symmetric(0, 4));
+            let r = ui.add(edit);
+            if r.changed() {
+                self.selected = 0;
+                self.dirty = true;
+            }
+            if !self.sync_open && self.editor.is_none() && self.actions.is_none() {
+                r.request_focus();
+            }
+        });
+        // magnifier
+        let c = Pos2::new(rect.left() + 24.0, rect.center().y - 1.0);
+        let p = ui.painter();
+        let color = if self.search_error.is_some() { pal.danger } else { pal.faint };
+        p.circle_stroke(c, 6.0, Stroke::new(1.7, color));
+        p.line_segment([c + Vec2::new(4.4, 4.4), c + Vec2::new(8.5, 8.5)], Stroke::new(1.9, color));
+        p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, pal.border));
+    }
+
+    /// "全部 ⌄" button opening the list of groups (like Raycast's type filter).
+    fn group_dropdown(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        let name = self.groups.list.get(self.group).map(|g| g.name.clone()).unwrap_or_default();
+        let resp = ui
+            .add(
+                egui::Button::new(RichText::new(format!("{name}    ")).size(13.0).color(pal.dim))
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .corner_radius(7)
+                    .min_size(Vec2::new(0.0, 28.0)),
+            )
+            .on_hover_text(format!("分组（{KEY_GROUP}1…9 / Tab 切换）"));
+        // chevron
+        let r = resp.rect;
+        let c = Pos2::new(r.right() - 14.0, r.center().y);
+        ui.painter().line(vec![c + Vec2::new(-3.5, -1.5), c + Vec2::new(0.0, 2.0), c + Vec2::new(3.5, -1.5)], Stroke::new(1.4, pal.faint));
+
+        let mut chosen = None;
+        let mut manage = false;
         let mut make_default = None;
-        let mut edit = None;
-        egui::ScrollArea::horizontal()
-            .id_salt("groups")
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    for (i, g) in self.groups.list.iter().enumerate() {
-                        let on = i == self.group;
-                        let (fg, sub) = if on { (pal.on_accent, pal.on_accent.gamma_multiply(0.75)) } else { (pal.dim, pal.faint) };
-                        let mut job = LayoutJob::default();
-                        if i < 9 {
-                            job.append(&format!("{} ", i + 1), 0.0, TextFormat { font_id: FontId::monospace(10.5), color: sub, ..Default::default() });
-                        }
-                        job.append(&g.name, 0.0, TextFormat { font_id: FontId::proportional(13.0), color: fg, ..Default::default() });
-                        let count = match self.counts.get(i) {
-                            Some(Some(n)) => format!("  {n}"),
-                            Some(None) => "  !".into(),
-                            None => String::new(),
-                        };
-                        if !count.is_empty() {
-                            job.append(&count, 0.0, TextFormat { font_id: FontId::proportional(11.5), color: sub, ..Default::default() });
-                        }
-                        let resp = ui
-                            .add(
-                                egui::Button::new(job)
-                                    .fill(if on { pal.accent } else { Color32::TRANSPARENT })
-                                    .stroke(Stroke::NONE)
-                                    .corner_radius(13)
-                                    .min_size(Vec2::new(0.0, 26.0)),
-                            )
-                            .on_hover_text(if i < 9 { format!("{KEY_GROUP}{} · 右键：设为默认 / 编辑", i + 1) } else { "右键：设为默认 / 编辑".into() });
-                        if resp.clicked() {
-                            clicked = Some(i);
-                        }
-                        resp.context_menu(|ui| {
-                            let is_default = self.groups.default == g.name;
-                            if ui.add_enabled(!is_default, egui::Button::new("设为默认分组")).clicked() {
-                                make_default = Some(i);
-                            }
-                            if ui.button("编辑分组…").clicked() {
-                                edit = Some(i);
-                            }
-                        });
+        egui::Popup::menu(&resp).show(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for (i, g) in self.groups.list.iter().enumerate() {
+                let (row, hover) = ui.allocate_exact_size(Vec2::new(230.0, 28.0), Sense::click());
+                let fill = if i == self.group { pal.selected } else if hover.hovered() { pal.hover } else { Color32::TRANSPARENT };
+                let p = ui.painter();
+                p.rect_filled(row, 6, fill);
+                let label = if self.groups.default == g.name { format!("{}  · 默认", g.name) } else { g.name.clone() };
+                p.text(row.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(13.0), pal.text);
+                let mut right = match self.counts.get(i) {
+                    Some(Some(n)) => n.to_string(),
+                    Some(None) => "规则无效".into(),
+                    None => String::new(),
+                };
+                if i < 9 {
+                    right = format!("{right}   {KEY_GROUP}{}", i + 1);
+                }
+                p.text(row.right_center() - Vec2::new(10.0, 0.0), Align2::RIGHT_CENTER, right, FontId::proportional(11.5), pal.faint);
+                if hover.clicked() {
+                    chosen = Some(i);
+                    ui.close();
+                }
+                hover.context_menu(|ui| {
+                    if ui.button("设为默认分组").clicked() {
+                        make_default = Some(i);
                     }
                 });
-            });
-        if let Some(i) = clicked {
+            }
+            ui.separator();
+            if ui.add(egui::Button::new(RichText::new("管理分组…").size(13.0)).frame(false).min_size(Vec2::new(230.0, 26.0))).clicked() {
+                manage = true;
+                ui.close();
+            }
+        });
+        if let Some(i) = chosen {
             self.set_group(i);
+        }
+        if manage {
+            self.editor = Some(Editor::new(&self.groups, self.group));
         }
         if let Some(i) = make_default {
             self.groups.default = self.groups.list[i].name.clone();
@@ -778,16 +958,16 @@ impl App {
                 Err(e) => self.notify(format!("保存失败：{e}")),
             }
         }
-        if let Some(i) = edit {
-            self.editor = Some(Editor::new(&self.groups, i));
-        }
     }
 
     fn list(&mut self, ui: &mut egui::Ui, pal: &Palette) -> Option<Action> {
         let mut action = None;
         if let Some(err) = &self.search_error {
-            ui.add_space(10.0);
-            ui.label(RichText::new(err).color(pal.danger).size(12.5));
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.label(RichText::new(err).color(pal.danger).size(12.5));
+            });
             return None;
         }
         if self.items.is_empty() {
@@ -806,97 +986,102 @@ impl App {
         let ctx = ui.ctx().clone();
         let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("list");
         if self.scroll_to_selected {
-            let top = self.selected as f32 * (ROW_H + ROW_GAP);
-            let bottom = top + ROW_H;
-            if top < self.scroll_offset {
-                area = area.vertical_scroll_offset(top);
-            } else if bottom > self.scroll_offset + self.view_height && self.view_height > 0.0 {
-                area = area.vertical_scroll_offset(bottom - self.view_height);
+            if let Some(&y) = self.item_y.get(self.selected) {
+                // keep the section header of the first item visible too
+                let top = if self.lines.iter().any(|(ly, l)| matches!(l, Line::Section(_)) && (y - ly - SECTION_H).abs() < 0.5) { y - SECTION_H } else { y };
+                let bottom = y + ROW_H;
+                if top < self.scroll_offset {
+                    area = area.vertical_scroll_offset(top);
+                } else if bottom > self.scroll_offset + self.view_height && self.view_height > 0.0 {
+                    area = area.vertical_scroll_offset(bottom - self.view_height + 4.0);
+                }
             }
             self.scroll_to_selected = false;
         }
-        let out = area.show_rows(ui, ROW_H, self.items.len(), |ui, range| {
-            ui.spacing_mut().item_spacing.y = ROW_GAP;
-            for i in range {
-                let meta = self.items[i].clone();
-                let width = ui.available_width();
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click());
-                let selected = i == self.selected;
-                let fill = if selected {
-                    pal.selected
-                } else if resp.hovered() {
-                    pal.hover
-                } else {
-                    Color32::TRANSPARENT
-                };
-                ui.painter().rect_filled(rect, 9, fill);
-
-                let kind = if meta.kind == Kind::Image { TextKind::Image } else { classify(&meta.preview, false) };
-                // leading tile
-                let tile = Rect::from_center_size(Pos2::new(rect.left() + 26.0, rect.center().y), Vec2::splat(34.0));
-                self.paint_tile(ui, &ctx, pal, tile, &meta, kind);
-
-                let x = tile.right() + 10.0;
-                let right_pad = if i < 9 { 44.0 } else { 14.0 };
-                let text_w = (rect.right() - x - right_pad).max(40.0);
-                let title = match meta.kind {
-                    Kind::Text => one_line(&meta.preview),
-                    Kind::Image => meta
-                        .ocr
-                        .as_deref()
-                        .map(one_line)
-                        .filter(|t| !t.is_empty())
-                        .unwrap_or_else(|| format!("{} × {}", meta.width, meta.height)),
-                };
-                let painter = ui.painter();
-                let mut job = LayoutJob::single_section(title, TextFormat { font_id: FontId::proportional(13.5), color: pal.text, ..Default::default() });
-                job.wrap.max_width = text_w;
-                job.wrap.max_rows = 1;
-                job.wrap.break_anywhere = true;
-                job.wrap.overflow_character = Some('…');
-                let galley = painter.layout_job(job);
-                let block_h = galley.size().y + 2.0 + 14.0;
-                let top = rect.center().y - block_h / 2.0;
-                painter.galley(Pos2::new(x, top), galley, pal.text);
-                let mut sub_job = LayoutJob::single_section(
-                    subtitle(&meta, kind),
-                    TextFormat { font_id: FontId::proportional(11.5), color: pal.faint, ..Default::default() },
-                );
-                sub_job.wrap.max_width = text_w;
-                sub_job.wrap.max_rows = 1;
-                sub_job.wrap.overflow_character = Some('…');
-                painter.galley(Pos2::new(x, top + block_h - 14.0), painter.layout_job(sub_job), pal.faint);
-
-                let mut rx = rect.right() - 12.0;
-                if i < 9 {
-                    let key = format!("{KEY_PASTE}{}", i + 1);
-                    let kr = painter.text(Pos2::new(rx, rect.center().y), Align2::RIGHT_CENTER, key, FontId::proportional(11.0), if selected { pal.dim } else { pal.faint.gamma_multiply(0.8) });
-                    rx = kr.left() - 6.0;
+        let lines = self.lines.clone();
+        let total = self.list_height;
+        let out = area.show_viewport(ui, |ui, viewport| {
+            let width = ui.available_width();
+            let origin = ui.max_rect().min;
+            ui.set_height(total);
+            for (y, line) in lines {
+                let h = if matches!(line, Line::Section(_)) { SECTION_H } else { ROW_H };
+                if y + h < viewport.min.y || y > viewport.max.y {
+                    continue;
                 }
-                if meta.pinned {
-                    painter.circle_filled(Pos2::new(rx - 3.0, rect.center().y), 3.0, pal.accent);
-                }
-
-                if resp.clicked() {
-                    self.selected = i;
-                }
-                if resp.double_clicked() {
-                    action = Some(Action::Activate(i));
-                }
-                resp.context_menu(|ui| {
-                    if ui.button("粘贴").clicked() {
-                        action = Some(Action::Activate(i));
-                        ui.close();
+                let rect = Rect::from_min_size(origin + Vec2::new(0.0, y), Vec2::new(width, h));
+                match line {
+                    Line::Section(name) => {
+                        ui.painter().text(
+                            Pos2::new(rect.left() + 14.0, rect.bottom() - 9.0),
+                            Align2::LEFT_BOTTOM,
+                            name,
+                            FontId::proportional(11.5),
+                            pal.faint,
+                        );
                     }
-                    if ui.button(if meta.pinned { "取消固定" } else { "固定" }).clicked() {
-                        action = Some(Action::Pin(i));
-                        ui.close();
+                    Line::Item(i) => {
+                        let meta = self.items[i].clone();
+                        let row = rect.shrink2(Vec2::new(6.0, 1.0));
+                        let resp = ui.interact(row, egui::Id::unique(("row", meta.id)), Sense::click());
+                        let selected = i == self.selected;
+                        let fill = if selected {
+                            pal.selected
+                        } else if resp.hovered() {
+                            pal.hover
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        ui.painter().rect_filled(row, 8, fill);
+                        let kind = if meta.kind == Kind::Image { TextKind::Image } else { classify(&meta.preview, false) };
+                        let tile = Rect::from_center_size(Pos2::new(row.left() + 20.0, row.center().y), Vec2::splat(22.0));
+                        self.paint_tile(ui, &ctx, pal, tile, &meta, kind);
+
+                        // accessories on the right: pinned dot + time
+                        let painter = ui.painter();
+                        let time = painter.text(
+                            Pos2::new(row.right() - 10.0, row.center().y),
+                            Align2::RIGHT_CENTER,
+                            short_time(meta.created, self.tz),
+                            FontId::proportional(11.5),
+                            pal.faint,
+                        );
+                        let mut right = time.left() - 10.0;
+                        if meta.pinned {
+                            painter.circle_filled(Pos2::new(right - 2.0, row.center().y), 3.0, pal.accent);
+                            right -= 12.0;
+                        }
+                        let x = tile.right() + 10.0;
+                        let title = match meta.kind {
+                            Kind::Text => one_line(&meta.preview),
+                            Kind::Image => meta
+                                .ocr
+                                .as_deref()
+                                .map(one_line)
+                                .filter(|t| !t.is_empty() && t != "(空白)")
+                                .unwrap_or_else(|| format!("图片 {}×{}", meta.width, meta.height)),
+                        };
+                        let mut job = LayoutJob::single_section(title, TextFormat { font_id: FontId::proportional(13.5), color: pal.text, ..Default::default() });
+                        job.wrap.max_width = (right - x).max(30.0);
+                        job.wrap.max_rows = 1;
+                        job.wrap.break_anywhere = true;
+                        job.wrap.overflow_character = Some('…');
+                        let galley = painter.layout_job(job);
+                        let gy = row.center().y - galley.size().y / 2.0;
+                        painter.galley(Pos2::new(x, gy), galley, pal.text);
+
+                        if resp.clicked() {
+                            self.selected = i;
+                        }
+                        if resp.double_clicked() {
+                            action = Some(Action::Activate(i));
+                        }
+                        if resp.secondary_clicked() {
+                            self.selected = i;
+                            self.actions = Some(0);
+                        }
                     }
-                    if ui.button(RichText::new("删除").color(pal.danger)).clicked() {
-                        action = Some(Action::Delete(i));
-                        ui.close();
-                    }
-                });
+                }
             }
         });
         self.scroll_offset = out.state.clamped_offset().y;
@@ -916,70 +1101,66 @@ impl App {
                     let f = ts.x / ts.y;
                     Rect::from_min_max(Pos2::new(0.0, (1.0 - f) / 2.0), Pos2::new(1.0, (1.0 + f) / 2.0))
                 };
-                egui::Image::from_texture((tex.id(), tile.size())).uv(uv).corner_radius(8).paint_at(ui, tile);
-                ui.painter().rect_stroke(tile, 8, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+                egui::Image::from_texture((tex.id(), tile.size())).uv(uv).corner_radius(5).paint_at(ui, tile);
+                ui.painter().rect_stroke(tile, 5, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
                 return;
             }
         }
         let p = ui.painter();
         if kind == TextKind::Color {
             if let Some(c) = kinds::parse_color(&meta.preview).map(color32) {
-                p.rect_filled(tile, 8, c);
-                p.rect_stroke(tile, 8, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+                p.rect_filled(tile, 5, c);
+                p.rect_stroke(tile, 5, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
                 return;
             }
         }
         let tint = pal.tint(kind);
-        p.rect_filled(tile, 8, tint.gamma_multiply(if pal.dark { 0.18 } else { 0.12 }));
-        let size = if kind.glyph().chars().count() > 2 { 11.0 } else { 14.0 };
+        p.rect_filled(tile, 5, tint.gamma_multiply(if pal.dark { 0.22 } else { 0.14 }));
+        let size = if kind.glyph().chars().count() > 2 { 8.5 } else { 11.0 };
         p.text(tile.center(), Align2::CENTER_CENTER, kind.glyph(), FontId::proportional(size), tint);
     }
 
+    /// Detail pane: content on top, metadata table below (Raycast style).
     fn preview(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let Some(meta) = self.items.get(self.selected).cloned() else { return };
         let ctx = ui.ctx().clone();
-        egui::Frame::new()
-            .fill(pal.surface)
-            .corner_radius(12)
-            .stroke(Stroke::new(1.0, pal.border))
-            .inner_margin(Margin::same(14))
-            .show(ui, |ui| {
-                ui.set_min_size(ui.available_size());
-                let kind = match self.detail(&ctx, meta.id) {
-                    Detail::Text { kind, .. } => *kind,
-                    Detail::Image { .. } => TextKind::Image,
-                    Detail::Missing => TextKind::Plain,
-                };
-                // header: type chip + facts
-                ui.horizontal(|ui| {
-                    let tint = pal.tint(kind);
-                    egui::Frame::new().fill(tint.gamma_multiply(if pal.dark { 0.2 } else { 0.12 })).corner_radius(6).inner_margin(Margin::symmetric(8, 2)).show(
-                        ui,
-                        |ui| {
-                            ui.label(RichText::new(kind.label()).size(11.5).strong().color(tint));
-                        },
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new(facts(&meta)).size(11.5).color(pal.faint));
-                    });
-                });
-                ui.add_space(6.0);
-                let footer_h = 20.0;
-                let body = Vec2::new(ui.available_width(), (ui.available_height() - footer_h - 8.0).max(60.0));
-                ui.allocate_ui_with_layout(body, Layout::top_down(Align::LEFT), |ui| {
-                    ui.set_min_size(body);
-                    self.preview_body(ui, pal, &meta, kind);
-                });
-                ui.add_space(4.0);
-                let mut info = vec![relative_time(meta.created)];
-                if let Some(src) = &meta.source {
-                    info.push(format!("来自 {src}"));
-                }
-                if meta.pinned {
-                    info.push("已固定".into());
-                }
-                ui.label(RichText::new(info.join("  ·  ")).size(11.5).color(pal.faint));
+        let kind = match self.detail(&ctx, meta.id) {
+            Detail::Text { kind, .. } => *kind,
+            Detail::Image { .. } => TextKind::Image,
+            Detail::Missing => TextKind::Plain,
+        };
+        let mut rows: Vec<(&str, String)> = vec![("类型", kind.label().to_string()), ("来源", meta.source.clone().unwrap_or_else(|| "本机".into()))];
+        rows.push(match meta.kind {
+            Kind::Text => ("内容", format!("{} 字符 · {} 行", meta.chars, meta.lines)),
+            Kind::Image => ("尺寸", format!("{} × {}", meta.width, meta.height)),
+        });
+        rows.push(("大小", human_size(meta.bytes)));
+        rows.push(("复制时间", abs_time(meta.created, self.tz)));
+        let meta_h = 30.0 + rows.len() as f32 * 25.0;
+
+        egui::Frame::new().inner_margin(Margin { left: 16, right: 16, top: 14, bottom: 8 }).show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
+            ui.spacing_mut().item_spacing.y = 0.0; // rows below are measured exactly
+            let body = Vec2::new(ui.available_width(), (ui.available_height() - meta_h).max(60.0));
+            ui.allocate_ui_with_layout(body, Layout::top_down(Align::LEFT), |ui| {
+                ui.set_min_size(body);
+                ui.set_max_height(body.y);
+                ui.spacing_mut().item_spacing.y = 6.0;
+                self.preview_body(ui, pal, &meta, kind);
             });
+            // metadata
+            let w = ui.available_width();
+            let (title, _) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::hover());
+            ui.painter().hline(title.x_range(), title.top() + 6.0, Stroke::new(1.0, pal.border));
+            ui.painter().text(Pos2::new(title.left(), title.bottom() - 4.0), Align2::LEFT_BOTTOM, "信息", FontId::proportional(11.5), pal.faint);
+            for (k, v) in rows {
+                let (r, _) = ui.allocate_exact_size(Vec2::new(w, 25.0), Sense::hover());
+                let p = ui.painter();
+                p.text(r.left_center(), Align2::LEFT_CENTER, k, FontId::proportional(12.0), pal.dim);
+                p.text(r.right_center(), Align2::RIGHT_CENTER, v, FontId::proportional(12.0), pal.text);
+                p.hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, pal.border.gamma_multiply(0.6)));
+            }
+        });
     }
 
     fn preview_body(&mut self, ui: &mut egui::Ui, pal: &Palette, meta: &ItemMeta, kind: TextKind) {
@@ -992,7 +1173,7 @@ impl App {
             Detail::Image { tex } => {
                 let ocr_text = meta.ocr.clone().filter(|t| !t.trim().is_empty());
                 let full = ui.available_size();
-                let img_h = if ocr_text.is_some() { (full.y * 0.66).floor() } else { full.y - 20.0 };
+                let img_h = if ocr_text.is_some() { (full.y * 0.66).floor() } else { full.y - 28.0 };
                 if let Some(tex) = tex {
                     let ts = tex.size_vec2();
                     let s = (full.x / ts.x).min(img_h / ts.y).min(1.0);
@@ -1410,42 +1591,135 @@ impl App {
         }
     }
 
+    /// Bottom action bar: context on the left, primary action and the action
+    /// panel shortcut on the right.
     fn footer(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 5.0;
-            let enter = if cfg!(target_os = "macos") { "⏎" } else { "Enter" };
-            #[cfg(target_os = "macos")]
-            let nav_keys = "↑↓ ⌃J/K ⌃N/P";
-            #[cfg(not(target_os = "macos"))]
-            let nav_keys = "↑↓ Ctrl+J/K/N/P";
-            for (k, label) in [
-                (nav_keys, "选择"),
-                (enter, "粘贴"),
-                (&format!("{KEY_GROUP}1-9") as &str, "分组"),
-                (&format!("{KEY_PASTE}1-9") as &str, "快速粘贴"),
-            ] {
-                keycap(ui, pal, k);
-                ui.label(RichText::new(label).size(11.0).color(pal.faint));
-                ui.add_space(4.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), FOOTER_H), Sense::hover());
+        let p = ui.painter();
+        p.hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, pal.border));
+        // left: app badge + context
+        let badge = Rect::from_center_size(Pos2::new(rect.left() + 22.0, rect.center().y), Vec2::splat(18.0));
+        p.rect_filled(badge, 5, pal.accent);
+        p.text(badge.center(), Align2::CENTER_CENTER, "c", FontId::proportional(12.0), pal.on_accent);
+        let mut ctx_text = format!("剪贴板历史  ·  {}", self.groups.list.get(self.group).map(|g| g.name.as_str()).unwrap_or(""));
+        ctx_text.push_str(&format!("  ·  {} 条", self.items.len()));
+        if self.paused {
+            ctx_text.push_str("  ·  已暂停");
+        }
+        let left = p.text(Pos2::new(badge.right() + 8.0, rect.center().y), Align2::LEFT_CENTER, ctx_text, FontId::proportional(12.0), pal.dim);
+        if let Some(sync) = self.sync.as_ref().filter(|s| s.paired) {
+            let n = sync.peers.len();
+            let dot = Pos2::new(left.right() + 14.0, rect.center().y);
+            p.circle_filled(dot, 3.0, if n > 0 { pal.ok } else { pal.faint });
+            p.text(dot + Vec2::new(7.0, 0.0), Align2::LEFT_CENTER, format!("同步 {n} 台"), FontId::proportional(12.0), pal.dim);
+        }
+
+        // right: "复制到剪贴板 ⏎ | 操作 ⌘K"
+        let inner = rect.shrink2(Vec2::new(10.0, 6.0));
+        let mut open_actions = false;
+        let mut copy = false;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner).layout(Layout::right_to_left(Align::Center)), |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if bar_button(ui, pal, "操作", KEY_ACTIONS, false).clicked() {
+                open_actions = true;
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if let Some(sync) = self.sync.as_ref().filter(|s| s.paired) {
-                    let n = sync.peers.len();
-                    let r = ui
-                        .add(egui::Label::new(RichText::new(format!("同步 {n} 台")).size(11.0).color(if n > 0 { pal.ok } else { pal.faint })).sense(Sense::click()))
-                        .on_hover_text("局域网同步");
-                    if r.clicked() {
-                        self.sync_open = true;
-                    }
-                    ui.label(RichText::new("·").size(11.0).color(pal.faint));
-                }
-                if self.paused {
-                    ui.label(RichText::new("已暂停记录").size(11.0).color(pal.danger));
-                    ui.label(RichText::new("·").size(11.0).color(pal.faint));
-                }
-                ui.label(RichText::new(format!("{} 条", self.items.len())).size(11.0).color(pal.faint));
-            });
+            let (sep, _) = ui.allocate_exact_size(Vec2::new(9.0, 16.0), Sense::hover());
+            ui.painter().vline(sep.center().x, sep.y_range(), Stroke::new(1.0, pal.border));
+            let enter = if cfg!(target_os = "macos") { "⏎" } else { "Enter" };
+            if !self.items.is_empty() && bar_button(ui, pal, "复制到剪贴板", enter, true).clicked() {
+                copy = true;
+            }
         });
+        if open_actions {
+            self.actions = if self.actions.is_some() { None } else { Some(0) };
+        }
+        if copy {
+            self.pending_copy = true;
+        }
+    }
+
+    /// ⌘K panel floating above the bottom-right corner.
+    fn action_panel(&mut self, ctx: &egui::Context, pal: &Palette) -> Option<Action> {
+        let sel = self.actions?;
+        let rows = self.panel_rows();
+        let screen = ctx.content_rect();
+        let mut clicked = None;
+        let mut hovered = None;
+        let area = egui::Area::new(egui::Id::unique("action-panel"))
+            .order(egui::Order::Foreground)
+            .pivot(Align2::RIGHT_BOTTOM)
+            .fixed_pos(Pos2::new(screen.right() - 10.0, screen.bottom() - FOOTER_H - 6.0))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(pal.surface)
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .corner_radius(12)
+                    .inner_margin(Margin::same(6))
+                    .shadow(egui::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(if pal.dark { 120 } else { 50 }) })
+                    .show(ui, |ui| {
+                        ui.set_width(300.0);
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        let mut idx = 0;
+                        for (n, row) in rows.iter().enumerate() {
+                            match row {
+                                PanelRow::Title(t) => {
+                                    if n > 0 {
+                                        let (r, _) = ui.allocate_exact_size(Vec2::new(300.0, 9.0), Sense::hover());
+                                        ui.painter().hline(r.x_range(), r.center().y, Stroke::new(1.0, pal.border));
+                                    }
+                                    let (r, _) = ui.allocate_exact_size(Vec2::new(300.0, 24.0), Sense::hover());
+                                    let mut job = LayoutJob::single_section(t.clone(), TextFormat { font_id: FontId::proportional(11.5), color: pal.faint, ..Default::default() });
+                                    job.wrap.max_width = 280.0;
+                                    job.wrap.max_rows = 1;
+                                    job.wrap.break_anywhere = true;
+                                    job.wrap.overflow_character = Some('…');
+                                    let g = ui.painter().layout_job(job);
+                                    ui.painter().galley(Pos2::new(r.left() + 10.0, r.center().y - g.size().y / 2.0), g, pal.faint);
+                                }
+                                PanelRow::Act(_, label, keys) => {
+                                    let (r, resp) = ui.allocate_exact_size(Vec2::new(300.0, 32.0), Sense::click());
+                                    if idx == sel {
+                                        ui.painter().rect_filled(r, 7, pal.selected);
+                                    }
+                                    let danger = label == "删除";
+                                    ui.painter().text(
+                                        r.left_center() + Vec2::new(10.0, 0.0),
+                                        Align2::LEFT_CENTER,
+                                        label,
+                                        FontId::proportional(13.5),
+                                        if danger { pal.danger } else { pal.text },
+                                    );
+                                    if !keys.is_empty() {
+                                        paint_keycap(ui.painter(), pal, r.right_center() - Vec2::new(10.0, 0.0), keys);
+                                    }
+                                    if resp.hovered() && ui.input(|i| i.pointer.delta() != Vec2::ZERO) {
+                                        hovered = Some(idx);
+                                    }
+                                    if resp.clicked() {
+                                        clicked = Some(idx);
+                                    }
+                                    idx += 1;
+                                }
+                            }
+                        }
+                    });
+            });
+        if let Some(h) = hovered {
+            self.actions = Some(h);
+        }
+        if let Some(c) = clicked {
+            let act = self.panel_acts().get(c).cloned();
+            self.actions = None;
+            return act.and_then(|a| self.run_act(ctx, a));
+        }
+        // click outside closes
+        if ctx.input(|i| i.pointer.any_click()) && !area.response.contains_pointer() {
+            let over_bar = ctx.input(|i| i.pointer.interact_pos()).is_some_and(|p| p.y > screen.bottom() - FOOTER_H);
+            if !over_bar {
+                self.actions = None;
+            }
+        }
+        None
     }
 }
 
@@ -1474,59 +1748,71 @@ impl eframe::App for App {
         ctx.all_styles_mut(|s| {
             s.visuals.selection.bg_fill = pal.accent.gamma_multiply(0.35);
             s.visuals.selection.stroke = Stroke::new(1.0, pal.accent);
-            s.visuals.extreme_bg_color = pal.bg;
-            s.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, pal.border);
+            s.visuals.extreme_bg_color = if pal.dark { Color32::from_rgb(28, 28, 31) } else { Color32::from_rgb(244, 244, 246) };
             s.visuals.window_fill = pal.surface;
             s.visuals.panel_fill = pal.bg;
+            s.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, pal.border);
             s.visuals.widgets.inactive.weak_bg_fill = pal.hover;
             s.visuals.widgets.hovered.weak_bg_fill = pal.selected;
+            s.visuals.widgets.inactive.fg_stroke.color = pal.text;
+            s.visuals.widgets.noninteractive.fg_stroke.color = pal.text;
         });
 
         egui::Frame::new()
             .fill(pal.bg)
             .stroke(Stroke::new(1.0, pal.border))
-            .corner_radius(CornerRadius::same(16))
-            .inner_margin(Margin::same(12))
+            .corner_radius(CornerRadius::same(12))
             .show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
                 // Drag the borderless window by any empty area.
                 let bg = ui.interact(ui.max_rect(), ui.scope_id().with("window-drag"), Sense::click_and_drag());
                 if bg.drag_started() {
                     ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                 }
-
                 self.header(ui, &pal);
-                ui.add_space(6.0);
-                self.group_bar(ui, &pal);
-                ui.add_space(4.0);
                 let banner = self.error.clone().or_else(|| self.groups_error.clone());
                 if let Some(err) = banner {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(err).color(pal.danger).size(12.0));
-                        if self.error.is_some() && ui.small_button("重试").clicked() {
-                            self.error = None;
-                            self.connect();
-                            self.dirty = true;
-                        }
+                    egui::Frame::new().inner_margin(Margin::symmetric(14, 6)).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            ui.label(RichText::new(err).color(pal.danger).size(12.0));
+                            if self.error.is_some() && ui.small_button("重试").clicked() {
+                                self.error = None;
+                                self.connect();
+                                self.dirty = true;
+                            }
+                        });
                     });
                 }
-                let footer_h = 22.0;
-                let body_h = (ui.available_height() - footer_h - 6.0).max(80.0);
-                ui.horizontal_top(|ui| {
-                    let list_w = (ui.available_width() * 0.47).floor();
+                let body_h = (ui.available_height() - FOOTER_H).max(80.0);
+                let w = ui.available_width();
+                ui.allocate_ui_with_layout(Vec2::new(w, body_h), Layout::left_to_right(Align::Min), |ui| {
+                    let list_w = (w * 0.42).floor();
                     ui.allocate_ui_with_layout(Vec2::new(list_w, body_h), Layout::top_down(Align::LEFT), |ui| {
                         ui.set_min_size(Vec2::new(list_w, body_h));
+                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
                         if let Some(a) = self.list(ui, &pal) {
                             action = Some(a);
                         }
                     });
+                    let (line, _) = ui.allocate_exact_size(Vec2::new(1.0, body_h), Sense::hover());
+                    ui.painter().vline(line.center().x, line.y_range(), Stroke::new(1.0, pal.border));
                     ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), body_h), Layout::top_down(Align::LEFT), |ui| {
+                        ui.set_min_size(Vec2::new(ui.available_width(), body_h));
+                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
                         self.preview(ui, &pal);
                     });
                 });
-                ui.add_space(4.0);
                 self.footer(ui, &pal);
             });
+
+        if let Some(a) = self.action_panel(&ctx, &pal) {
+            action = Some(a);
+        }
+        if std::mem::take(&mut self.pending_copy) {
+            action = Some(Action::Activate(self.selected));
+        }
 
         // transient notice (e.g. "saved")
         if let Some((msg, at)) = &self.notice {
@@ -1535,10 +1821,10 @@ impl eframe::App for App {
                 egui::Area::new(egui::Id::unique("notice"))
                     .order(egui::Order::Tooltip)
                     .pivot(Align2::CENTER_BOTTOM)
-                    .fixed_pos(Pos2::new(screen.center().x, screen.bottom() - 44.0))
+                    .fixed_pos(Pos2::new(screen.center().x, screen.bottom() - FOOTER_H - 10.0))
                     .show(&ctx, |ui| {
-                        egui::Frame::new().fill(pal.text).corner_radius(8).inner_margin(Margin::symmetric(12, 6)).show(ui, |ui| {
-                            ui.label(RichText::new(msg).size(12.5).color(pal.bg.to_opaque()));
+                        egui::Frame::new().fill(pal.surface).stroke(Stroke::new(1.0, pal.border)).corner_radius(8).inner_margin(Margin::symmetric(12, 6)).show(ui, |ui| {
+                            ui.label(RichText::new(msg).size(12.5).color(pal.text));
                         });
                     });
                 ctx.request_repaint_after(Duration::from_millis(200));
@@ -1588,6 +1874,30 @@ fn primary_button<'a>(pal: &Palette, text: &'a str) -> egui::Button<'a> {
     egui::Button::new(RichText::new(text).color(pal.on_accent).strong()).fill(pal.accent).stroke(Stroke::NONE).corner_radius(8)
 }
 
+/// "label [key]" button of the action bar.
+fn bar_button(ui: &mut egui::Ui, pal: &Palette, label: &str, key: &str, strong: bool) -> egui::Response {
+    let font = FontId::proportional(12.5);
+    let text_w = ui.painter().layout_no_wrap(label.to_string(), font.clone(), pal.text).size().x;
+    let key_w = ui.painter().layout_no_wrap(key.to_string(), FontId::proportional(11.0), pal.dim).size().x + 10.0;
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(text_w + key_w + 22.0, 26.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(r, 6, pal.hover);
+    }
+    ui.painter().text(r.left_center() + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, label, font, if strong { pal.text } else { pal.dim });
+    paint_keycap(ui.painter(), pal, r.right_center() - Vec2::new(6.0, 0.0), key);
+    resp
+}
+
+/// Small rounded key label, right-aligned at `right_center`.
+fn paint_keycap(p: &egui::Painter, pal: &Palette, right_center: Pos2, key: &str) {
+    let g = p.layout_no_wrap(key.to_string(), FontId::proportional(11.0), pal.dim);
+    let size = Vec2::new(g.size().x + 10.0, 20.0);
+    let r = Rect::from_min_size(Pos2::new(right_center.x - size.x, right_center.y - size.y / 2.0), size);
+    p.rect_filled(r, 5, if pal.dark { Color32::from_rgba_unmultiplied(255, 255, 255, 18) } else { Color32::from_rgba_unmultiplied(0, 0, 0, 14) });
+    p.galley(Pos2::new(r.left() + 5.0, r.center().y - g.size().y / 2.0), g, pal.dim);
+}
+
+#[allow(dead_code)]
 fn keycap(ui: &mut egui::Ui, pal: &Palette, key: &str) {
     egui::Frame::new()
         .fill(pal.surface)
@@ -1681,26 +1991,71 @@ fn one_line(s: &str) -> String {
     if line.is_empty() { "(空白)".into() } else { line.replace('\t', "  ") }
 }
 
-fn subtitle(m: &ItemMeta, kind: TextKind) -> String {
-    let mut parts = vec![kind.label().to_string(), relative_time(m.created)];
-    match m.kind {
-        Kind::Text if m.lines > 1 => parts.push(format!("{} 行", m.lines)),
-        Kind::Image => parts.push(format!("{}×{}", m.width, m.height)),
-        _ => {}
+/// Local time zone offset (seconds east of UTC).
+fn local_offset() -> i64 {
+    #[cfg(unix)]
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if !libc::localtime_r(&now, &mut tm).is_null() {
+            return tm.tm_gmtoff as i64;
+        }
     }
-    if let Some(src) = &m.source {
-        parts.push(src.clone());
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+        let mut tz: TIME_ZONE_INFORMATION = std::mem::zeroed();
+        let r = GetTimeZoneInformation(&mut tz);
+        let bias = tz.Bias + if r == 2 { tz.DaylightBias } else { tz.StandardBias };
+        return -(bias as i64) * 60;
     }
-    parts.join(" · ")
+    #[allow(unreachable_code)]
+    0
 }
 
-fn facts(m: &ItemMeta) -> String {
-    match m.kind {
-        Kind::Text => format!("{} 字符 · {} 行 · {}", m.chars, m.lines, human_size(m.bytes)),
-        Kind::Image => format!("{} × {} · {}", m.width, m.height, human_size(m.bytes)),
+/// (year, month, day, hour, minute) of a unix time in the local zone.
+fn civil(t: i64, tz: i64) -> (i64, u32, u32, u32, u32) {
+    let secs = t + tz;
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    // Howard Hinnant's days -> civil algorithm
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d, (sod / 3600) as u32, (sod % 3600 / 60) as u32)
+}
+
+fn abs_time(t: i64, tz: i64) -> String {
+    let (y, mo, d, h, mi) = civil(t, tz);
+    format!("{y}-{mo:02}-{d:02} {h:02}:{mi:02}")
+}
+
+/// Compact time for list accessories: 刚刚 / 5 分钟 / 3 小时 / 昨天 / 4 天 / 11-02.
+fn short_time(t: i64, tz: i64) -> String {
+    let now = now_secs();
+    let d = (now - t).max(0);
+    let days = (now + tz).div_euclid(86_400) - (t + tz).div_euclid(86_400);
+    match (d, days) {
+        (0..=59, _) => "刚刚".into(),
+        (60..=3599, _) => format!("{} 分钟", d / 60),
+        (_, 0) => format!("{} 小时", d / 3600),
+        (_, 1) => "昨天".into(),
+        (_, 2..=6) => format!("{days} 天"),
+        _ => {
+            let (y, m, dd, ..) = civil(t, tz);
+            let (ny, ..) = civil(now, tz);
+            if y == ny { format!("{m:02}-{dd:02}") } else { format!("{y}-{m:02}-{dd:02}") }
+        }
     }
 }
 
+#[allow(dead_code)]
 fn relative_time(t: i64) -> String {
     let d = (now_secs() - t).max(0);
     match d {
@@ -1723,5 +2078,19 @@ fn human_size(b: u64) -> String {
         format!("{:.1} KB", f / K)
     } else {
         format!("{:.1} MB", f / K / K)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_dates() {
+        assert_eq!(civil(0, 0), (1970, 1, 1, 0, 0));
+        assert_eq!(abs_time(1_795_416_115, 8 * 3600), "2026-11-23 14:41");
+        assert_eq!(civil(951_782_400, 0), (2000, 2, 29, 0, 0)); // leap day
+        assert_eq!(short_time(now_secs() - 5, 0), "刚刚");
+        assert_eq!(short_time(now_secs() - 300, 0), "5 分钟");
     }
 }

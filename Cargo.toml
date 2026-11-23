@@ -34,9 +34,10 @@ zbus = { version = "5", default-features = false, features = ["blocking-api", "a
 
 [target."cfg(windows)".dependencies]
 windows = { version = "0.62.2", features = ["Globalization", "Media_Ocr", "Graphics_Imaging", "Storage_Streams", "Foundation", "Win32_System_WinRT"] }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_UI_WindowsAndMessaging", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Console", "Win32_System_LibraryLoader"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_UI_WindowsAndMessaging", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Time"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.191"
 objc2 = "0.6.5"
 objc2-app-kit = { version = "0.3.2", features = ["NSPasteboard", "NSWorkspace", "NSRunningApplication", "NSApplication", "NSResponder"] }
 objc2-foundation = { version = "0.3.2", features = ["NSString", "NSArray", "NSData", "NSDictionary", "NSError"] }
