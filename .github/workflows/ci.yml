@@ -11,23 +11,42 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: copym-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: copym-windows-x86_64
+          # Apple Silicon only for now (macos-latest runners are arm64).
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: copym-macos-aarch64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - name: Linux build deps
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev
       - run: cargo test --workspace
-      - run: cargo build --release
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Package (binary name carries OS and architecture)
+        shell: bash
+        run: |
+          mkdir dist
+          ext=""; [ "${{ runner.os }}" = Windows ] && ext=".exe"
+          cp "target/${{ matrix.target }}/release/copym$ext" "dist/${{ matrix.name }}$ext"
+          file "dist/${{ matrix.name }}$ext" || true
       - uses: actions/upload-artifact@v7
         with:
-          name: copym-${{ runner.os }}
-          path: |
-            target/release/copym
-            target/release/copym.exe
+          name: ${{ matrix.name }}
+          path: dist/*
 
   android:
     runs-on: ubuntu-latest
@@ -48,7 +67,15 @@ jobs:
       - name: Build APK
         working-directory: android
         run: ./gradlew assembleRelease --console=plain
+      - name: Name APKs by architecture
+        run: |
+          mkdir dist
+          for f in android/app/build/outputs/apk/release/app-*-release.apk; do
+            abi=$(basename "$f" | sed -E 's/^app-(.*)-release\.apk$/\1/')
+            cp "$f" "dist/copym-android-$abi.apk"
+          done
+          ls -l dist
       - uses: actions/upload-artifact@v7
         with:
           name: copym-android
-          path: android/app/build/outputs/apk/release/app-release.apk
+          path: dist/*.apk

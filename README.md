@@ -101,7 +101,7 @@ copym delete ID         # 删除（已配对设备上同步删除）
 
 ## 安卓端
 
-`android/` 是原生安卓 App（Kotlin + Jetpack Compose，Material 3 动态取色，Android 8.0+）。历史存储和同步直接复用桌面端的 Rust 代码（`crates/copym-core` + `crates/copym-sync`，通过 JNI 调用），APK 约 8 MB。
+`android/` 是原生安卓 App（Kotlin + Jetpack Compose，Material 3 动态取色，Android 8.0+）。历史存储和同步直接复用桌面端的 Rust 代码（`crates/copym-core` + `crates/copym-sync`，通过 JNI 调用），按架构分包：arm64 约 3.4 MB，通用包约 8 MB。
 
 **系统限制**：Android 10 起系统禁止后台应用读取剪贴板，所以手机端不能像电脑那样自动记录每一次复制。copym 的做法：
 
@@ -119,7 +119,7 @@ copym delete ID         # 删除（已配对设备上同步删除）
 rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 cargo install cargo-ndk
 cd android && ./gradlew assembleRelease   # Gradle 会先调用 cargo-ndk 编译 Rust 库
-# 产物：android/app/build/outputs/apk/release/app-release.apk
+# 产物：android/app/build/outputs/apk/release/app-{arm64-v8a,armeabi-v7a,x86_64,universal}-release.apk
 ```
 
 未设置 `COPYM_KEYSTORE` 等签名环境变量时，release 包使用本机 debug 密钥签名，适合自用；不同机器打出的包签名不同，不能互相覆盖安装。
