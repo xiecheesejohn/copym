@@ -14,6 +14,7 @@ mod ipc;
 #[cfg(target_os = "linux")]
 mod kde_hotkey;
 mod ocr;
+mod paste;
 
 use model::{Filter, Kind, Request, Response};
 
@@ -33,7 +34,7 @@ COMMANDS:
     pause | resume  Stop / restart recording
     clear           Remove all non-pinned items
     status          Show daemon status
-    quit            Stop the daemon
+    quit            Stop copym (daemon and popup)
     sync            Show LAN sync status and connected devices
     sync pair       Show a one-time code to add another device (valid 3 min)
     sync join CODE[@IP:PORT]  Join the devices of CODE (address optional)
@@ -47,7 +48,11 @@ COMMANDS:
     help            Show this help
 ";
 
+/// Process start, for `COPYM_TRACE` timings.
+pub static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 fn main() {
+    START.get_or_init(std::time::Instant::now);
     // Older macOS versions pass "-psn_…" when an .app is opened from Finder.
     let args: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("-psn_")).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("show");
@@ -62,6 +67,7 @@ fn main() {
     let result = match cmd {
         "daemon" => daemon::run(),
         "gui" => gui::run(args.get(1).map(String::as_str).unwrap_or("")),
+        "popup-host" => gui::host(),
         "groups" => gui::run("groups"),
         "ocr" => ocr_cmd(&args[1..]),
         "show" | "toggle" => show(),

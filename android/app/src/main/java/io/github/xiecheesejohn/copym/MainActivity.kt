@@ -32,7 +32,7 @@ class MainActivity : ComponentActivity() {
         if (Prefs(this).backgroundSync) SyncService.start(this)
         setContent {
             CopymTheme {
-                MainScreen(onBackgroundSyncChanged = ::setBackgroundSync)
+                MainScreen(onBackgroundSyncChanged = ::setBackgroundSync, onQuit = ::quit)
             }
         }
     }
@@ -45,6 +45,13 @@ class MainActivity : ComponentActivity() {
         } else {
             SyncService.stop(this)
         }
+    }
+
+    /** Stop background sync and end the process (the sync engine lives in it). */
+    private fun quit() {
+        SyncService.stop(this)
+        finishAndRemoveTask()
+        android.os.Process.killProcess(android.os.Process.myPid())
     }
 
     /** The only moment Android lets us read the clipboard: when we have focus. */

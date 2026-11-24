@@ -32,6 +32,18 @@ pub struct Config {
     pub poll_interval_ms: u64,
     /// Close the popup when it loses focus.
     pub close_on_focus_lost: bool,
+    /// Keep the popup process loaded in the background so the hotkey opens it
+    /// instantly (costs some memory while hidden). false = start it on demand.
+    pub keep_popup_loaded: bool,
+    /// Where the keyboard goes when the popup opens: "list" (navigate right
+    /// away; press / or start typing in the search box with a click) or "search".
+    pub popup_focus: String,
+    /// Enter pastes the chosen item into the window that was active before the
+    /// popup (Shift+Enter only copies). false = Enter only copies.
+    pub paste_on_enter: bool,
+    /// Keys sent to paste: "ctrl+v", "shift+insert", "ctrl+shift+v" ...
+    /// (macOS: "cmd+v"). Empty = platform default.
+    pub paste_shortcut: String,
     /// "system", "dark" or "light".
     pub theme: String,
     /// Recognize text in images so they can be searched.
@@ -82,6 +94,10 @@ impl Default for Config {
             restore_empty_clipboard: true,
             poll_interval_ms: 500,
             close_on_focus_lost: true,
+            keep_popup_loaded: true,
+            popup_focus: "list".into(),
+            paste_on_enter: true,
+            paste_shortcut: String::new(),
             theme: "system".into(),
             ocr_enabled: true,
             ocr_engine: "auto".into(),

@@ -122,7 +122,7 @@ private fun loadGroups(): Groups =
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MainScreen(onBackgroundSyncChanged: (Boolean) -> Unit) {
+fun MainScreen(onBackgroundSyncChanged: (Boolean) -> Unit, onQuit: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
@@ -293,6 +293,7 @@ fun MainScreen(onBackgroundSyncChanged: (Boolean) -> Unit) {
                             },
                         )
                         DropdownMenuItem(text = { Text("清空历史（保留固定项）") }, onClick = { menu = false; confirmClear = true })
+                        DropdownMenuItem(text = { Text("退出 copym") }, onClick = { menu = false; onQuit() })
                     }
                 },
             )

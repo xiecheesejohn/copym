@@ -117,6 +117,8 @@ pub enum Request {
     GroupCounts { query: String, regex: bool, groups: Vec<GroupRule> },
     /// Forget all OCR results and recognize every image again.
     RedoOcr,
+    /// Send the paste shortcut to the focused window (after the popup closed).
+    Paste,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

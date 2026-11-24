@@ -27,6 +27,13 @@ class SyncService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_QUIT) {
+            // "退出" in the notification: stop syncing and end the process.
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            android.os.Process.killProcess(android.os.Process.myPid())
+            return START_NOT_STICKY
+        }
         Core.init(this)
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel(CHANNEL, "后台同步", NotificationManager.IMPORTANCE_MIN))
@@ -38,6 +45,15 @@ class SyncService : Service() {
             .setContentTitle("copym 正在同步")
             .setContentText("局域网剪贴板同步在后台运行")
             .setContentIntent(open)
+            .addAction(
+                Notification.Action.Builder(
+                    null,
+                    "退出",
+                    PendingIntent.getService(
+                        this, 1, Intent(this, SyncService::class.java).setAction(ACTION_QUIT), PendingIntent.FLAG_IMMUTABLE,
+                    ),
+                ).build(),
+            )
             .setOngoing(true)
             .build()
         try {
@@ -59,6 +75,7 @@ class SyncService : Service() {
 
     companion object {
         private const val CHANNEL = "sync"
+        private const val ACTION_QUIT = "io.github.xiecheesejohn.copym.QUIT"
         fun start(ctx: Context) {
             try {
                 ContextCompat.startForegroundService(ctx, Intent(ctx, SyncService::class.java))

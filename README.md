@@ -2,7 +2,8 @@
 
 用 Rust 编写的现代化、高性能、跨平台（Linux / Windows / macOS，另有安卓端）剪贴板管理器。
 
-- **低占用**：常驻的只有一个约 7 MB 内存、空闲 0% CPU 的守护进程；界面是按需启动的独立进程，关闭即退出。
+- **低占用、秒开**：守护进程约 9 MB 内存、空闲 0% CPU；弹窗进程默认在后台预加载（约 35 MB），按快捷键后约 10 ms 就画出界面。不在乎速度时可设 `keep_popup_loaded = false`，改为按需启动、关闭即退出。
+- **选中即粘贴**：打开弹窗后直接用方向键 / `j` `k` 选择，按 `Enter` 自动粘贴到之前的窗口（`Shift+Enter` 只复制），可在配置里关闭。
 - **原生监听**：Wayland `ext-data-control` / `wlr-data-control`，X11 XFixes，Windows `AddClipboardFormatListener`，macOS `NSPasteboard.changeCount`。
 - **跳过密码管理器**：识别 Bitwarden、KeePassXC、1Password 等设置的隐私标记，内容根本不会被读取：
   - Linux：`x-kde-passwordManagerHint = secret`
@@ -37,7 +38,8 @@ copym daemon            # 前台运行守护进程（调试用）
 copym                   # = copym show：打开/关闭弹窗，必要时自动启动守护进程
 copym autostart on      # 登录时自动启动
 copym search 发票 | copym search -r '\d{6}'   # 搜索（含图片中的文字）
-copym list 20 | copym select ID | copym pause | copym resume | copym clear | copym status | copym quit
+copym list 20 | copym select ID | copym pause | copym resume | copym clear | copym status
+copym quit              # 退出（也可以点弹窗右下角的 ⏻，或按 Ctrl+Q / ⌘Q）
 copym config            # 显示配置文件路径
 copym groups            # 打开分组管理器
 copym sync              # 同步状态；sync pair / sync join 码 / sync leave
@@ -52,29 +54,44 @@ copym pin ID            # 固定 / 取消固定
 - 其他 Wayland 桌面（GNOME / Hyprland …）：请在系统设置里把命令 `copym show` 绑定到快捷键。
 
 
+弹窗打开时键盘在列表上（`popup_focus = "list"`），可以直接选择；按 `/`、`Ctrl+F` 或点搜索框才开始输入搜索，搜索时按 `Esc` 回到列表。
+
 弹窗内（macOS 上 Ctrl → ⌘、Alt → ⌥）：
 
 | 按键 | 作用 |
 |---|---|
 | `↑` `↓` / `PgUp` `PgDn` | 选择 |
+| `j` / `k`，`g` / `G`（列表模式） | 下一条 / 上一条，第一条 / 最后一条 |
+| `1…9`（列表模式）/ `Alt+1…9` | 直接粘贴第 N 条 |
+| `/` / `Ctrl+F` | 开始搜索 |
 | `Ctrl+J` / `Ctrl+K`（Vim） | 下一条 / 上一条 |
 | `Ctrl+N` / `Ctrl+P`（Emacs） | 下一条 / 上一条（macOS 上是 Control 键，不是 ⌘） |
-| `Enter` / 双击 | 放回剪贴板并关闭 |
-| `Alt+1…9` | 直接选第 N 条 |
+| `Enter` / 双击 | 粘贴到之前的窗口（`paste_on_enter = false` 时只复制） |
+| `Shift+Enter` | 只复制到剪贴板（`paste_on_enter = false` 时改为粘贴） |
 | `Ctrl+1…9` | 切换到第 N 个分组 |
 | `Tab` / `Shift+Tab` | 下一个 / 上一个分组 |
 | `Ctrl+R` | 切换正则搜索 |
 | `Ctrl+S` | 固定 / 取消固定 |
-| `Alt+K`（macOS `⌘K`）/ 右键 | 打开操作面板：复制、在浏览器打开、固定、删除、暂停记录、同步、管理分组、开机自启 |
+| `Alt+K`（macOS `⌘K`）/ 右键 | 打开操作面板：粘贴、复制、在浏览器打开、固定、删除、暂停记录、同步、管理分组、开机自启、退出 |
 | `Shift+Del` / `Ctrl+D` | 删除 |
-| `Esc` | 清空搜索；再按关闭 |
+| `Ctrl+Q` / 右下角 ⏻ | 退出 copym（守护进程和弹窗） |
+| `Esc` | 搜索中：清空并回到列表；列表中：关闭 |
+
+### 自动粘贴
+
+按 `Enter` 后弹窗先关闭，焦点回到之前的窗口，再模拟一次粘贴快捷键（默认 `Ctrl+V`，macOS `⌘V`，可用 `paste_shortcut` 改成 `shift+insert`、`ctrl+shift+v` 等，例如终端里常用后者）。
+
+- **Windows**：`SendInput`，无需额外设置。
+- **macOS**：第一次使用时需要在“系统设置 → 隐私与安全性 → 辅助功能”里允许 copym。
+- **Linux X11**：XTEST，无需额外设置。
+- **Linux Wayland**：通过 `/dev/uinput` 虚拟键盘（当前用户需要有写权限，许多发行版的游戏手柄 / 远程桌面软件包会配好；或者自行添加 udev 规则），否则尝试 `wtype`、`ydotool`。都不可用时内容仍在剪贴板里，下次打开弹窗会提示原因。
 
 ## 分组
 
 分组在搜索栏右侧的下拉菜单里（和 Raycast 的类型筛选一样），菜单中显示每个分组的条目数（随搜索实时变化）和快捷键。一个条目可以同时属于多个分组。默认分组：全部、文本、图片、链接、固定。
 
 - **管理**：分组下拉菜单 →“管理分组…”（或操作面板、或运行 `copym groups`），可新建、删除、排序、修改规则，并实时显示当前有多少条匹配。
-- **默认分组**：在分组下拉菜单里右键某个分组 →“设为默认分组”，或在管理器里勾选“打开弹窗时默认显示这个分组”。
+- **默认分组**：在分组下拉菜单里右键某个分组即设为默认，或在管理器里勾选“打开弹窗时默认显示这个分组”。
 - **规则**保存在配置目录的 `groups.toml`，也可以直接编辑：
 
 ```toml
@@ -111,6 +128,10 @@ rest = true              # 不属于任何带 patterns / apps 的分组
 | `ignore_patterns` | [] | 正则，匹配的文本不记录 |
 | `restore_empty_clipboard` | true | Wayland：剪贴板被清空时恢复最新一条 |
 | `close_on_focus_lost` | true | 弹窗失焦自动关闭 |
+| `keep_popup_loaded` | true | 弹窗进程常驻后台，打开更快（约多占 35 MB 内存） |
+| `popup_focus` | list | 打开弹窗时键盘在 `list`（列表）还是 `search`（搜索框） |
+| `paste_on_enter` | true | `Enter` 自动粘贴到之前的窗口；false 时只复制 |
+| `paste_shortcut` | （空 = `ctrl+v` / macOS `cmd+v`） | 粘贴时模拟的按键 |
 | `theme` | system | system / dark / light |
 | `ocr_enabled` | true | 识别图片中的文字 |
 | `ocr_engine` | auto | auto / native / tesseract / off |
@@ -186,7 +207,7 @@ copym ocr redo          # 用当前引擎重新识别所有已保存的图片
 - **分组**：和电脑版相同的规则（同一种 `groups.toml` 格式），顶部标签显示数量；长按标签可设为默认或编辑；菜单 →“管理分组…”可新建、排序、删除，实时显示匹配条数。来源正则可以匹配同步过来的设备名，例如建一个“来自电脑”的分组。
 - **按类型显示与预览**：列表里链接显示域名、颜色显示色块、代码和 JSON 用等宽字体；长按条目打开预览——颜色给出 HEX / RGB / HSL（可单独复制）、JSON 自动格式化、链接可在浏览器打开、邮箱可直接写邮件、图片显示原图和识别出的文字。
 - **外接键盘**：`↑↓`、Vim（搜索框外 `j` / `k`，任意位置 `Ctrl+J` / `Ctrl+K`）、Emacs（`Ctrl+N` / `Ctrl+P`）上下选择；`Enter` 复制；`Tab` / `Ctrl+1…9` 切换分组；`Alt+1…9` 复制第 N 条；`Ctrl+S` 固定；`Ctrl+D` 删除；`/` 聚焦搜索框；`Esc` 清空搜索。
-- 搜索 / 正则搜索、清空历史、配对码配对（生成或加入）、手动地址（Wi-Fi 屏蔽 mDNS 时用），以及可选的“后台保持同步”（前台服务；Android 15 起系统限制每天 6 小时）。
+- 搜索 / 正则搜索、清空历史、配对码配对（生成或加入）、手动地址（Wi-Fi 屏蔽 mDNS 时用），以及可选的“后台保持同步”（前台服务；Android 15 起系统限制每天 6 小时）。右上角菜单和后台通知里都有“退出”，会停止同步并结束进程。
 
 构建（需要 Android SDK 35、NDK r27c、JDK 17+、Rust 安卓目标和 `cargo-ndk`）：
 
@@ -217,6 +238,7 @@ src/
   clip/            各平台剪贴板后端（wayland/ x11 windows macos + arboard 读写）
   ipc.rs           本地 socket（Unix 0700 目录 / Windows 命名管道）+ postcard 帧
   gui.rs           egui 弹窗（列表、按类型预览、分组栏、分组管理器、同步面板）
+  paste.rs         自动粘贴：模拟粘贴快捷键（SendInput / CGEvent / XTEST / uinput）
   groups.rs        分组定义（groups.toml）
   filter.rs        应用 / 正则 / 大小过滤
   ocr.rs           图片文字识别（Vision / Windows.Media.Ocr / Tesseract）

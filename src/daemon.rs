@@ -15,7 +15,10 @@ struct Shared {
     store: Mutex<Store>,
     writer: Mutex<Box<dyn ClipWriter>>,
     paused: AtomicBool,
+    /// The popup: a one-shot process, or the long-lived popup host.
     gui: Mutex<Option<Child>>,
+    keep_popup_loaded: bool,
+    paste_shortcut: String,
     backend: &'static str,
     /// Image ids waiting for text recognition.
     ocr_tx: Option<mpsc::Sender<u64>>,
@@ -117,6 +120,13 @@ impl Shared {
                     self.status()
                 }
                 Request::Status => self.status(),
+                Request::Paste => {
+                    // The popup has just closed: give the compositor a moment to
+                    // focus the previous window again.
+                    std::thread::sleep(std::time::Duration::from_millis(if cfg!(target_os = "macos") { 120 } else { 80 }));
+                    crate::paste::send(&self.paste_shortcut).inspect_err(|e| eprintln!("copym: paste: {e}"))?;
+                    Response::Ok
+                }
                 Request::ToggleGui { activation_token } => {
                     self.toggle_gui(activation_token)?;
                     Response::Ok
@@ -206,6 +216,32 @@ impl Shared {
 
     /// Open the popup, or close it if it is already open.
     fn toggle_gui(&self, token: Option<String>) -> Result<(), String> {
+        #[cfg(windows)]
+        unsafe {
+            // We just received the hotkey, so we may hand foreground rights to the popup.
+            windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
+                windows_sys::Win32::UI::WindowsAndMessaging::ASFW_ANY,
+            );
+        }
+        if self.keep_popup_loaded {
+            let line = format!("toggle\t{}\t{}\n", token.as_deref().unwrap_or("-"), previous_window().unwrap_or_else(|| "-".into()));
+            for _ in 0..2 {
+                self.start_popup_host()?;
+                let mut gui = self.gui.lock().unwrap();
+                let sent = gui.as_mut().and_then(|c| c.stdin.as_mut()).map(|w| {
+                    use std::io::Write;
+                    w.write_all(line.as_bytes()).and_then(|_| w.flush()).is_ok()
+                });
+                if sent == Some(true) {
+                    return Ok(());
+                }
+                if let Some(mut c) = gui.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
+            return Err("popup host does not respond".into());
+        }
         let mut gui = self.gui.lock().unwrap();
         if let Some(child) = gui.as_mut() {
             if matches!(child.try_wait(), Ok(None)) {
@@ -226,13 +262,25 @@ impl Shared {
                 cmd.env_remove("XDG_ACTIVATION_TOKEN");
             }
         }
-        #[cfg(windows)]
-        unsafe {
-            // We just received the hotkey, so we may hand foreground rights to the popup.
-            windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
-                windows_sys::Win32::UI::WindowsAndMessaging::ASFW_ANY,
-            );
+        match previous_window() {
+            Some(w) => cmd.env("COPYM_PREV_WINDOW", w),
+            None => cmd.env_remove("COPYM_PREV_WINDOW"),
+        };
+        *gui = Some(cmd.spawn().map_err(|e| e.to_string())?);
+        Ok(())
+    }
+
+    /// Start the long-lived popup process (no window until the first toggle).
+    fn start_popup_host(&self) -> Result<(), String> {
+        let mut gui = self.gui.lock().unwrap();
+        if let Some(c) = gui.as_mut() {
+            if matches!(c.try_wait(), Ok(None)) {
+                return Ok(());
+            }
         }
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let mut cmd = Command::new(exe);
+        cmd.arg("popup-host").stdin(Stdio::piped()).stdout(Stdio::null()).env_remove("XDG_ACTIVATION_TOKEN");
         *gui = Some(cmd.spawn().map_err(|e| e.to_string())?);
         Ok(())
     }
@@ -270,6 +318,8 @@ pub fn run() -> Result<(), String> {
         writer: Mutex::new(monitor.writer),
         paused: AtomicBool::new(false),
         gui: Mutex::new(None),
+        keep_popup_loaded: cfg.keep_popup_loaded && !config::is_secondary_instance(),
+        paste_shortcut: cfg.paste_shortcut.clone(),
         backend: monitor.backend,
         ocr_tx: ocr.as_ref().map(|_| ocr_tx.clone()),
         ocr_name: ocr.as_ref().map(Ocr::name),
@@ -396,6 +446,13 @@ pub fn run() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
 
+    // Load the popup in the background so the first hotkey press is fast too.
+    if shared.keep_popup_loaded {
+        if let Err(e) = shared.start_popup_host() {
+            eprintln!("copym: cannot start popup host: {e}");
+        }
+    }
+
     // IPC server.
     let listener = ipc::listen().map_err(|e| format!("cannot open IPC socket: {e}"))?;
     {
@@ -466,6 +523,23 @@ fn register_hotkey(spec: &str, shared: Arc<Shared>) -> Option<global_hotkey::Glo
     }));
     eprintln!("copym: hotkey {spec} registered");
     Some(manager)
+}
+
+/// The window that was active before the popup opens, so the popup can hand
+/// focus back to it (Windows: HWND, macOS: process id).
+fn previous_window() -> Option<String> {
+    #[cfg(windows)]
+    {
+        let h = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+        return (!h.is_null()).then(|| (h as isize).to_string());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let ws = objc2_app_kit::NSWorkspace::sharedWorkspace();
+        return ws.frontmostApplication().map(|a| a.processIdentifier().to_string());
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 /// Start the daemon in the background if it is not running yet.

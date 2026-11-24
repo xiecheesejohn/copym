@@ -1,8 +1,9 @@
 //! The popup window (egui / eframe, OpenGL renderer).
 //!
-//! It is a short-lived process: started by the daemon on hotkey, talks to the
-//! daemon over IPC, and exits after an item is chosen. Nothing GUI related
-//! stays in memory while the popup is closed.
+//! A separate process that talks to the daemon over IPC. By default it is the
+//! long-lived "popup host" (fonts and event loop stay loaded, each hotkey press
+//! only creates the window); with `keep_popup_loaded = false` it is started on
+//! demand and exits when the window closes.
 
 use crate::config::Config;
 use crate::groups::{self, GroupDef, Groups};
@@ -16,7 +17,8 @@ use eframe::egui::{
 };
 use copym_core::kinds::{self, classify, TextKind};
 use std::collections::HashMap;
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const ROW_H: f32 = 40.0;
@@ -35,11 +37,103 @@ const KEY_ACTIONS: &str = "⌘K";
 #[cfg(not(target_os = "macos"))]
 const KEY_ACTIONS: &str = "Alt+K";
 
-/// `open`: "" (normal), "sync" (sync dialog), "groups" (group manager) or
-/// "actions" (action panel).
+/// What the popup asks for once its window is gone.
+#[derive(Default)]
+struct AfterClose {
+    /// Send the paste shortcut to the previous window.
+    paste: bool,
+}
+
+/// One-shot popup process. `open`: "" (normal), "sync" (sync dialog),
+/// "groups" (group manager) or "actions" (action panel).
 pub fn run(open: &str) -> Result<(), String> {
+    trace("gui::run");
+    let prev = std::env::var("COPYM_PREV_WINDOW").ok();
+    let after = open_window(None, Config::load(), open, None, Arc::new(AtomicBool::new(false)))?;
+    if let Some(e) = finish(&after, prev.as_deref()) {
+        eprintln!("copym: {e}");
+    }
+    Ok(())
+}
+
+/// Long-lived popup process (`keep_popup_loaded`): fonts and the event loop
+/// stay loaded, so the hotkey only has to create the window. The daemon
+/// writes `toggle<TAB>activation-token<TAB>previous-window` lines on stdin.
+pub fn host() -> Result<(), String> {
+    trace("popup host");
+    let ctx = egui::Context::default();
+    setup_ctx(&ctx, &Config::load());
+    let open = Arc::new(AtomicBool::new(false));
+    let close = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel::<Option<(Option<String>, Option<String>)>>();
+    {
+        let (ctx, open, close) = (ctx.clone(), open.clone(), close.clone());
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                let mut parts = line.split('\t').map(|p| (p != "-" && !p.is_empty()).then(|| p.to_string()));
+                let _cmd = parts.next();
+                let token = parts.next().flatten();
+                let prev = parts.next().flatten();
+                if open.swap(true, Ordering::SeqCst) {
+                    // Already open (or opening): the hotkey closes it.
+                    close.store(true, Ordering::SeqCst);
+                    ctx.request_repaint();
+                } else if tx.send(Some((token, prev))).is_err() {
+                    break;
+                }
+            }
+            // stdin closed: the daemon is gone.
+            close.store(true, Ordering::SeqCst);
+            ctx.request_repaint();
+            let _ = tx.send(None);
+        });
+    }
+    let mut shown = false;
+    let mut notice = None;
+    while let Ok(Some((token, prev))) = rx.recv() {
+        trace("show");
+        // SAFETY: only this thread reads the environment from here on
+        // (winit reads the activation token when it creates the window).
+        unsafe {
+            match &token {
+                Some(t) => std::env::set_var("XDG_ACTIVATION_TOKEN", t),
+                None => std::env::remove_var("XDG_ACTIVATION_TOKEN"),
+            }
+        }
+        if shown {
+            // Every window gets a new GL context: upload the whole font atlas again.
+            let atlas = ctx.fonts(|f| f.image());
+            ctx.tex_manager().write().set(
+                egui::TextureId::default(),
+                egui::epaint::ImageDelta::full(atlas, egui::epaint::TextureAtlas::texture_options()),
+            );
+        }
+        // Start every window fresh: no open menus, no widget state (scroll
+        // positions…) from the previous one. (Fonts and style stay.)
+        egui::Popup::close_all(&ctx);
+        ctx.memory_mut(|m| m.data.clear());
+        close.store(false, Ordering::SeqCst);
+        let after = open_window(Some(ctx.clone()), Config::load(), "", notice.take(), close.clone());
+        shown = true;
+        open.store(false, Ordering::SeqCst);
+        match after {
+            Ok(after) => notice = finish(&after, prev.as_deref()).map(|e| format!("自动粘贴失败：{e}（内容已在剪贴板）")),
+            Err(e) => {
+                eprintln!("copym: popup: {e}");
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_window(ctx: Option<egui::Context>, cfg: Config, open: &str, notice: Option<String>, close: Arc<AtomicBool>) -> Result<AfterClose, String> {
     let open = open.to_string();
-    let cfg = Config::load();
+    let fresh = ctx.is_none();
+    let after = Arc::new(Mutex::new(AfterClose::default()));
+    let result = after.clone();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("copym")
@@ -54,35 +148,21 @@ pub fn run(open: &str) -> Result<(), String> {
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
-    eframe::run_native(
+    eframe::run_native_ext(
         "copym",
         options,
+        ctx,
         Box::new(move |cc| {
-            install_fonts(&cc.egui_ctx);
-            match cfg.theme.as_str() {
-                "dark" => cc.egui_ctx.set_theme(egui::ThemePreference::Dark),
-                "light" => cc.egui_ctx.set_theme(egui::ThemePreference::Light),
-                _ => cc.egui_ctx.set_theme(egui::ThemePreference::System),
+            trace("window + GL ready");
+            if fresh {
+                setup_ctx(&cc.egui_ctx, &cfg);
+                trace("fonts");
             }
-            cc.egui_ctx.all_styles_mut(|s| {
-                s.spacing.item_spacing = egui::vec2(8.0, 6.0);
-                s.spacing.button_padding = egui::vec2(10.0, 5.0);
-                s.spacing.scroll.bar_width = 6.0;
-                s.spacing.scroll.floating = true;
-                s.interaction.selectable_labels = false;
-                s.visuals.window_corner_radius = CornerRadius::same(12);
-                s.visuals.menu_corner_radius = CornerRadius::same(10);
-                for w in [
-                    &mut s.visuals.widgets.inactive,
-                    &mut s.visuals.widgets.hovered,
-                    &mut s.visuals.widgets.active,
-                    &mut s.visuals.widgets.noninteractive,
-                    &mut s.visuals.widgets.open,
-                ] {
-                    w.corner_radius = CornerRadius::same(7);
-                }
-            });
-            let mut app = App::new(cfg);
+            let mut app = App::new(cfg, after, close);
+            trace("app state");
+            if let Some(n) = notice {
+                app.notify(n);
+            }
             app.sync_open = open == "sync";
             if open == "actions" {
                 app.actions = Some(0);
@@ -93,7 +173,69 @@ pub fn run(open: &str) -> Result<(), String> {
             Ok(Box::new(app))
         }),
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    let mut r = result.lock().unwrap();
+    Ok(std::mem::take(&mut *r))
+}
+
+/// Fonts, theme and widget style (once per egui context).
+fn setup_ctx(ctx: &egui::Context, cfg: &Config) {
+    install_fonts(ctx);
+    match cfg.theme.as_str() {
+        "dark" => ctx.set_theme(egui::ThemePreference::Dark),
+        "light" => ctx.set_theme(egui::ThemePreference::Light),
+        _ => ctx.set_theme(egui::ThemePreference::System),
+    }
+    ctx.all_styles_mut(|s| {
+        s.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        s.spacing.button_padding = egui::vec2(10.0, 5.0);
+        s.spacing.scroll.bar_width = 6.0;
+        s.spacing.scroll.floating = true;
+        s.interaction.selectable_labels = false;
+        s.visuals.window_corner_radius = CornerRadius::same(12);
+        s.visuals.menu_corner_radius = CornerRadius::same(10);
+        for w in [
+            &mut s.visuals.widgets.inactive,
+            &mut s.visuals.widgets.hovered,
+            &mut s.visuals.widgets.active,
+            &mut s.visuals.widgets.noninteractive,
+            &mut s.visuals.widgets.open,
+        ] {
+            w.corner_radius = CornerRadius::same(7);
+        }
+    });
+}
+
+/// After the window closed: give focus back to the previous window and paste.
+/// Returns the paste error, if any.
+fn finish(after: &AfterClose, prev: Option<&str>) -> Option<String> {
+    restore_focus(prev);
+    if !after.paste {
+        return None;
+    }
+    trace("paste");
+    match Client::connect().and_then(|mut c| c.request(&Request::Paste)) {
+        Ok(Response::Err(e)) => Some(e),
+        Err(e) => Some(e.to_string()),
+        Ok(_) => None,
+    }
+}
+
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn restore_focus(prev: Option<&str>) {
+    #[cfg(windows)]
+    if let Some(h) = prev.and_then(|p| p.parse::<isize>().ok()) {
+        // We are the foreground process, so this is allowed.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(h as _);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(mtm) = objc2::MainThreadMarker::new() {
+        // A windowless app stays active on macOS: hide it so the previous app
+        // gets the focus back.
+        objc2_app_kit::NSApplication::sharedApplication(mtm).hide(None);
+    }
 }
 
 // ------------------------------------------------------------------ fonts --
@@ -288,11 +430,18 @@ struct App {
     list_height: f32,
     /// Action panel (⌘K) open, with the selected action.
     actions: Option<usize>,
-    /// "复制到剪贴板" clicked in the action bar.
-    pending_copy: bool,
+    /// Primary button clicked in the action bar (paste?).
+    pending_activate: Option<bool>,
+    /// Quit button clicked.
+    pending_quit: bool,
     /// Local time zone offset in seconds.
     tz: i64,
     frames: u64,
+    /// Keyboard goes to the search box (otherwise to the list).
+    search_mode: bool,
+    /// Set by the popup host when the hotkey asks the window to close.
+    close_req: Arc<AtomicBool>,
+    after: Arc<Mutex<AfterClose>>,
 }
 
 #[derive(Clone, Copy)]
@@ -303,6 +452,7 @@ enum Line {
 
 #[derive(Clone)]
 enum Act {
+    Paste,
     Copy,
     Pin,
     OpenUrl(String),
@@ -313,6 +463,7 @@ enum Act {
     Groups,
     Autostart,
     Settings,
+    Quit,
 }
 
 enum PanelRow {
@@ -370,13 +521,14 @@ impl Editor {
 }
 
 enum Action {
-    Activate(usize),
+    /// (index, paste into the previous window)
+    Activate(usize, bool),
     Delete(usize),
     Pin(usize),
 }
 
 impl App {
-    fn new(cfg: Config) -> Self {
+    fn new(cfg: Config, after: Arc<Mutex<AfterClose>>, close_req: Arc<AtomicBool>) -> Self {
         let (groups, groups_error) = groups::load();
         let group = groups.default_index();
         let mut app = Self {
@@ -415,10 +567,15 @@ impl App {
             item_y: Vec::new(),
             list_height: 0.0,
             actions: None,
-            pending_copy: false,
+            pending_activate: None,
+            pending_quit: false,
             tz: local_offset(),
             frames: 0,
+            search_mode: false,
+            close_req,
+            after,
         };
+        app.search_mode = app.cfg.popup_focus == "search";
         app.connect();
         if let Some(Response::Status { paused, ocr, .. }) = app.req(&Request::Status) {
             app.paused = paused;
@@ -581,9 +738,10 @@ impl App {
 
     fn perform(&mut self, ctx: &egui::Context, action: Action) {
         match action {
-            Action::Activate(i) => {
+            Action::Activate(i, paste) => {
                 if let Some(id) = self.items.get(i).map(|m| m.id) {
                     if self.req(&Request::Activate { id }).is_some() {
+                        self.after.lock().unwrap().paste = paste;
                         ctx.send_viewport_cmd(ViewportCommand::Close);
                     }
                 }
@@ -627,7 +785,12 @@ impl App {
         let mut group = None;
         let mut toggle_regex = false;
         let mut open_actions = false;
+        let mut search = false;
+        let mut quit = false;
+        let list_mode = !self.search_mode;
         let page = ((self.view_height / ROW_H).floor() as isize).max(1);
+        let last = self.items.len() as isize;
+        let paste = self.cfg.paste_on_enter;
         ctx.input_mut(|i| {
             // Action panel: ⌘K on macOS, Alt+K elsewhere (Ctrl+K is Vim "up").
             #[cfg(target_os = "macos")]
@@ -637,6 +800,9 @@ impl App {
             if actions_key {
                 open_actions = true;
                 i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::Q) {
+                quit = true;
             }
             // Down / up: arrows, Vim (Ctrl+J / Ctrl+K) and Emacs (Ctrl+N / Ctrl+P).
             // Plain Ctrl - on macOS ⌘ stays free for the app's own shortcuts.
@@ -658,8 +824,12 @@ impl App {
             if i.consume_key(Modifiers::NONE, Key::PageUp) {
                 nav = -page;
             }
+            // Shift+Enter first: matching ignores extra Shift.
+            if i.consume_key(Modifiers::SHIFT, Key::Enter) {
+                action = Some(Action::Activate(self.selected, !paste));
+            }
             if i.consume_key(Modifiers::NONE, Key::Enter) {
-                action = Some(Action::Activate(self.selected));
+                action = Some(Action::Activate(self.selected, paste));
             }
             if i.consume_key(Modifiers::COMMAND, Key::S) {
                 action = Some(Action::Pin(self.selected));
@@ -667,7 +837,6 @@ impl App {
             if i.consume_key(Modifiers::SHIFT, Key::Delete) || i.consume_key(Modifiers::COMMAND, Key::D) {
                 action = Some(Action::Delete(self.selected));
             }
-            // Shift+Tab first: matching ignores extra Shift.
             if i.consume_key(Modifiers::SHIFT, Key::Tab) {
                 cycle = -1;
             }
@@ -677,16 +846,39 @@ impl App {
             if i.consume_key(Modifiers::COMMAND, Key::R) || i.consume_key(Modifiers::ALT, Key::R) {
                 toggle_regex = true;
             }
+            if i.consume_key(Modifiers::COMMAND, Key::F) {
+                search = true;
+            }
             let digits = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
             let mut swallow_text = false;
             for (n, k) in digits.iter().enumerate() {
                 if i.consume_key(Modifiers::COMMAND, *k) {
                     group = Some(n);
                 }
-                if i.consume_key(Modifiers::ALT, *k) {
-                    action = Some(Action::Activate(n));
+                if i.consume_key(Modifiers::ALT, *k) || (list_mode && i.consume_key(Modifiers::NONE, *k)) {
+                    action = Some(Action::Activate(n, paste));
                     swallow_text = true;
                 }
+            }
+            if list_mode {
+                // Vim-style keys while the list has the keyboard.
+                if i.consume_key(Modifiers::NONE, Key::J) {
+                    nav = 1;
+                }
+                if i.consume_key(Modifiers::NONE, Key::K) {
+                    nav = -1;
+                }
+                if i.consume_key(Modifiers::NONE, Key::End) || i.consume_key(Modifiers::SHIFT, Key::G) {
+                    nav = last;
+                }
+                if i.consume_key(Modifiers::NONE, Key::Home) || i.consume_key(Modifiers::NONE, Key::G) {
+                    nav = -last;
+                }
+                if i.consume_key(Modifiers::NONE, Key::Slash) || i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "/")) {
+                    search = true;
+                }
+                // Nothing is typed into the search box until it is focused.
+                swallow_text = true;
             }
             if swallow_text {
                 // ⌥1 also types "¡" on macOS - keep it out of the search box.
@@ -696,6 +888,10 @@ impl App {
                 close = true;
             }
         });
+        if quit {
+            self.quit(ctx);
+            return None;
+        }
         if open_actions {
             self.actions = Some(0);
         }
@@ -713,15 +909,36 @@ impl App {
             let n = self.groups.list.len() as isize;
             self.set_group(((self.group as isize + cycle).rem_euclid(n)) as usize);
         }
+        if search {
+            self.search_mode = true;
+        }
         if close {
-            if self.query.is_empty() {
-                ctx.send_viewport_cmd(ViewportCommand::Close);
-            } else {
+            if self.search_mode {
+                // Esc leaves the search box (and clears it); a second Esc closes.
+                if !self.query.is_empty() {
+                    self.query.clear();
+                    self.dirty = true;
+                }
+                if self.cfg.popup_focus == "search" && self.query.is_empty() && !self.dirty {
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                } else {
+                    self.search_mode = false;
+                    ctx.memory_mut(|m| m.surrender_focus(egui::Id::unique("search")));
+                }
+            } else if !self.query.is_empty() {
                 self.query.clear();
                 self.dirty = true;
+            } else {
+                ctx.send_viewport_cmd(ViewportCommand::Close);
             }
         }
         action
+    }
+
+    /// Stop copym (daemon and popup).
+    fn quit(&mut self, ctx: &egui::Context) {
+        let _ = self.req(&Request::Quit);
+        ctx.send_viewport_cmd(ViewportCommand::Close);
     }
 
     /// Rows of the action panel for the selected item.
@@ -735,7 +952,10 @@ impl App {
                 Kind::Image => format!("图片 {}×{}", m.width, m.height),
             };
             rows.push(PanelRow::Title(title));
-            rows.push(PanelRow::Act(Act::Copy, "复制到剪贴板".into(), enter.into()));
+            let shift_enter = if cfg!(target_os = "macos") { "⇧⏎" } else { "Shift+Enter" };
+            let (paste_key, copy_key) = if self.cfg.paste_on_enter { (enter, shift_enter) } else { (shift_enter, enter) };
+            rows.push(PanelRow::Act(Act::Paste, "粘贴到当前窗口".into(), paste_key.into()));
+            rows.push(PanelRow::Act(Act::Copy, "复制到剪贴板".into(), copy_key.into()));
             if let Some((id, Detail::Text { kind, body })) = &self.detail {
                 if *id == m.id {
                     match kind {
@@ -754,6 +974,7 @@ impl App {
         rows.push(PanelRow::Act(Act::Groups, "管理分组…".into(), String::new()));
         rows.push(PanelRow::Act(Act::Autostart, if self.autostart { "关闭登录时自动启动" } else { "登录时自动启动" }.into(), String::new()));
         rows.push(PanelRow::Act(Act::Settings, "打开设置文件".into(), String::new()));
+        rows.push(PanelRow::Act(Act::Quit, "退出 copym".into(), format!("{cmd}Q")));
         rows
     }
 
@@ -805,7 +1026,9 @@ impl App {
 
     fn run_act(&mut self, _ctx: &egui::Context, act: Act) -> Option<Action> {
         match act {
-            Act::Copy => return Some(Action::Activate(self.selected)),
+            Act::Paste => return Some(Action::Activate(self.selected, true)),
+            Act::Copy => return Some(Action::Activate(self.selected, false)),
+            Act::Quit => self.pending_quit = true,
             Act::Pin => return Some(Action::Pin(self.selected)),
             Act::Delete => return Some(Action::Delete(self.selected)),
             Act::OpenUrl(u) => open_external(&u),
@@ -873,12 +1096,15 @@ impl App {
                 .text_color(pal.text)
                 .frame(egui::Frame::NONE)
                 .margin(Margin::symmetric(0, 4));
-            let r = ui.add(edit);
+            let r = ui.add(edit.id(egui::Id::unique("search")));
             if r.changed() {
                 self.selected = 0;
                 self.dirty = true;
             }
-            if !self.sync_open && self.editor.is_none() && self.actions.is_none() {
+            if r.has_focus() || r.clicked() {
+                self.search_mode = true;
+            }
+            if self.search_mode && !self.sync_open && self.editor.is_none() && self.actions.is_none() {
                 r.request_focus();
             }
         });
@@ -911,7 +1137,9 @@ impl App {
         let mut chosen = None;
         let mut manage = false;
         let mut make_default = None;
-        egui::Popup::menu(&resp).show(|ui| {
+        // Close only on a click outside: a right click on a row opens its own
+        // context menu ("设为默认分组") and must not close the list.
+        egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             for (i, g) in self.groups.list.iter().enumerate() {
                 let (row, hover) = ui.allocate_exact_size(Vec2::new(230.0, 28.0), Sense::click());
@@ -933,14 +1161,20 @@ impl App {
                     chosen = Some(i);
                     ui.close();
                 }
-                hover.context_menu(|ui| {
-                    if ui.button("设为默认分组").clicked() {
-                        make_default = Some(i);
-                    }
-                });
+                // Right click: make it the group shown when the popup opens. (A nested
+                // context menu would replace this popup - egui keeps one open.)
+                if hover.secondary_clicked() {
+                    make_default = Some(i);
+                }
             }
             ui.separator();
-            if ui.add(egui::Button::new(RichText::new("管理分组…").size(13.0)).frame(false).min_size(Vec2::new(230.0, 26.0))).clicked() {
+            let (row, hover) = ui.allocate_exact_size(Vec2::new(230.0, 28.0), Sense::click());
+            if hover.hovered() {
+                ui.painter().rect_filled(row, 6, pal.hover);
+            }
+            ui.painter().text(row.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, "管理分组…", FontId::proportional(13.0), pal.text);
+            ui.painter().text(row.right_center() - Vec2::new(10.0, 0.0), Align2::RIGHT_CENTER, "右键：设为默认", FontId::proportional(11.0), pal.faint);
+            if hover.clicked() {
                 manage = true;
                 ui.close();
             }
@@ -1074,7 +1308,7 @@ impl App {
                             self.selected = i;
                         }
                         if resp.double_clicked() {
-                            action = Some(Action::Activate(i));
+                            action = Some(Action::Activate(i, self.cfg.paste_on_enter));
                         }
                         if resp.secondary_clicked() {
                             self.selected = i;
@@ -1614,19 +1848,27 @@ impl App {
             p.text(dot + Vec2::new(7.0, 0.0), Align2::LEFT_CENTER, format!("同步 {n} 台"), FontId::proportional(12.0), pal.dim);
         }
 
-        // right: "复制到剪贴板 ⏎ | 操作 ⌘K"
+        // right: "粘贴 ⏎ | 操作 ⌘K | ⏻"
         let inner = rect.shrink2(Vec2::new(10.0, 6.0));
         let mut open_actions = false;
         let mut copy = false;
+        let mut quit = false;
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner).layout(Layout::right_to_left(Align::Center)), |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
+            let quit_key = if cfg!(target_os = "macos") { "⌘Q" } else { "Ctrl+Q" };
+            if power_button(ui, pal).on_hover_text(format!("退出 copym（{quit_key}）")).clicked() {
+                quit = true;
+            }
+            let (sep, _) = ui.allocate_exact_size(Vec2::new(9.0, 16.0), Sense::hover());
+            ui.painter().vline(sep.center().x, sep.y_range(), Stroke::new(1.0, pal.border));
             if bar_button(ui, pal, "操作", KEY_ACTIONS, false).clicked() {
                 open_actions = true;
             }
             let (sep, _) = ui.allocate_exact_size(Vec2::new(9.0, 16.0), Sense::hover());
             ui.painter().vline(sep.center().x, sep.y_range(), Stroke::new(1.0, pal.border));
             let enter = if cfg!(target_os = "macos") { "⏎" } else { "Enter" };
-            if !self.items.is_empty() && bar_button(ui, pal, "复制到剪贴板", enter, true).clicked() {
+            let label = if self.cfg.paste_on_enter { "粘贴" } else { "复制到剪贴板" };
+            if !self.items.is_empty() && bar_button(ui, pal, label, enter, true).clicked() {
                 copy = true;
             }
         });
@@ -1634,7 +1876,10 @@ impl App {
             self.actions = if self.actions.is_some() { None } else { Some(0) };
         }
         if copy {
-            self.pending_copy = true;
+            self.pending_activate = Some(self.cfg.paste_on_enter);
+        }
+        if quit {
+            self.pending_quit = true;
         }
     }
 
@@ -1731,6 +1976,9 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        if self.close_req.swap(false, Ordering::SeqCst) {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
         // Close when focus moves elsewhere (like a native popup).
         if let Some(focused) = ctx.input(|i| i.viewport().focused) {
             if focused {
@@ -1810,8 +2058,11 @@ impl eframe::App for App {
         if let Some(a) = self.action_panel(&ctx, &pal) {
             action = Some(a);
         }
-        if std::mem::take(&mut self.pending_copy) {
-            action = Some(Action::Activate(self.selected));
+        if let Some(paste) = self.pending_activate.take() {
+            action = Some(Action::Activate(self.selected, paste));
+        }
+        if std::mem::take(&mut self.pending_quit) {
+            self.quit(&ctx);
         }
 
         // transient notice (e.g. "saved")
@@ -1836,6 +2087,9 @@ impl eframe::App for App {
         // Popups/modals measure themselves in an invisible first pass; make sure
         // the first few frames are actually painted.
         self.frames += 1;
+        if self.frames <= 3 {
+            trace(&format!("frame {}", self.frames));
+        }
         if self.frames < 4 {
             ctx.request_repaint();
         }
@@ -1885,6 +2139,28 @@ fn bar_button(ui: &mut egui::Ui, pal: &Palette, label: &str, key: &str, strong: 
     }
     ui.painter().text(r.left_center() + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, label, font, if strong { pal.text } else { pal.dim });
     paint_keycap(ui.painter(), pal, r.right_center() - Vec2::new(6.0, 0.0), key);
+    resp
+}
+
+/// Square icon button with a power symbol (quit).
+fn power_button(ui: &mut egui::Ui, pal: &Palette) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(26.0, 26.0), Sense::click());
+    let color = if resp.hovered() { pal.danger } else { pal.faint };
+    if resp.hovered() {
+        ui.painter().rect_filled(r, 6, pal.hover);
+    }
+    let c = r.center();
+    let radius = 6.0;
+    // arc with a gap at the top, plus the vertical bar
+    let points: Vec<Pos2> = (0..=24)
+        .map(|i| {
+            let a = -std::f32::consts::FRAC_PI_2 + 0.75 + i as f32 / 24.0 * (std::f32::consts::TAU - 1.5);
+            c + Vec2::new(a.cos(), a.sin()) * radius
+        })
+        .collect();
+    let stroke = Stroke::new(1.6, color);
+    ui.painter().add(egui::Shape::line(points, stroke));
+    ui.painter().line_segment([c + Vec2::new(0.0, -radius - 1.0), c + Vec2::new(0.0, -1.0)], stroke);
     resp
 }
 
@@ -1969,6 +2245,13 @@ fn url_preview(ui: &mut egui::Ui, pal: &Palette, url: &str) {
 }
 
 // ---------------------------------------------------------------- helpers --
+
+/// `COPYM_TRACE=1`: print startup timings (ms since process start) to stderr.
+fn trace(what: &str) {
+    if std::env::var_os("COPYM_TRACE").is_some() {
+        eprintln!("[{:>6.1} ms] {what}", crate::START.get().map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0));
+    }
+}
 
 fn open_external(target: &str) {
     #[cfg(target_os = "linux")]
