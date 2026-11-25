@@ -20,15 +20,24 @@
 
 ## 安装
 
-- **macOS（Apple 芯片）**：下载 `copym-macos-aarch64.dmg`，打开后把 copym 拖进“应用程序”。首次打开时系统会提示“无法验证开发者”（没有 Apple 开发者证书签名），到“系统设置 → 隐私与安全性”底部点“仍要打开”即可。之后按 `Option+C` 呼出；在操作面板（`⌘K`）里选“登录时自动启动”。
-- **Windows / Linux**：下载对应的 `copym-windows-x86_64.exe` / `copym-linux-x86_64`，放到任意目录运行一次，然后 `copym autostart on`。
-- 以上文件都在 GitHub Actions 每次构建的产物里。
+下载地址：[Releases](https://github.com/xiecheesejohn/copym/releases/latest)（正式版本）；每次提交的最新构建在 GitHub Actions 的构建产物里（需登录 GitHub）。
+
+- **macOS（Apple 芯片）**：下载 `copym-macos-aarch64.dmg`，打开后把 copym 拖进“应用程序”。首次打开时系统会提示“无法验证开发者”（没有 Apple 开发者证书签名），到“系统设置 → 隐私与安全性”底部点“仍要打开”即可。之后按 `Option+C` 呼出，也可以在 Spotlight（`⌘空格`）里搜 copym 打开；在操作面板（`⌘K`）里选“登录时自动启动”。
+- **Windows**：下载 `copym-windows-x86_64.exe`，放到固定的目录（例如 `%LOCALAPPDATA%\Programs\copym\`）运行一次。之后在开始菜单 / Windows 搜索里搜 copym 就能打开（首次运行时自动创建开始菜单快捷方式），然后 `copym autostart on` 开机自启。
+- **Linux**：下载 `copym-linux-x86_64.tar.gz`，解压后放到 `~/.local/bin` 等目录运行一次，然后 `copym autostart on`。
+- **安卓**：按手机架构下载 `copym-android-*.apk`（一般选 `arm64-v8a`）。
 
 ## 构建
 
 ```sh
 cargo build --release          # 产物：target/release/copym
 packaging/macos/make-dmg.sh target/release/copym 0.1.0 copym.dmg   # 仅 macOS：打包 .app + DMG
+```
+
+发布新版本：把 `Cargo.toml` 的 `version` 改成新版本号并提交，然后打同名 tag 推送，CI 构建完会自动创建 GitHub Release 并上传所有平台的安装包（tag 和版本号不一致时会失败）：
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
 ```
 
 ## 使用
@@ -258,9 +267,10 @@ crates/copym-sync/ 局域网加密同步核心（平台无关）
 crates/copym-android/ 安卓 JNI 库（app.rs 业务逻辑 + lib.rs JNI 导出）
 android/           安卓 App（Kotlin + Compose）
 packaging/macos/   .app 的 Info.plist 与 DMG 打包脚本
-assets/icon.svg    应用图标
+assets/            应用图标（svg / png / Windows 用的 ico）、键位符号字体（fonts/）
+build.rs           Windows：把图标和版本信息嵌入 copym.exe
 ```
 
 ## 许可证
 
-双许可证：[MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE)，任选其一。内置的 PP-OCRv6 模型来自 PaddleOCR，Apache-2.0（见 [models/ppocr](models/ppocr/README.md)）。
+双许可证：[MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE)，任选其一。内置的 PP-OCRv6 模型来自 PaddleOCR，Apache-2.0（见 [models/ppocr](models/ppocr/README.md)）；键位符号字体截取自 Adwaita Sans，SIL OFL 1.1（见 [assets/fonts](assets/fonts/README.md)）。

@@ -294,6 +294,14 @@ pub fn run() -> Result<(), String> {
     let cfg = Config::load();
     let store = Store::open(&config::data_dir().join("history.redb"), cfg.max_items)?;
 
+    // Windows search finds apps through Start menu shortcuts.
+    #[cfg(windows)]
+    std::thread::spawn(|| {
+        if let Err(e) = crate::autostart::ensure_start_menu_shortcut() {
+            eprintln!("copym: Start menu shortcut: {e}");
+        }
+    });
+
     let (tx, rx) = mpsc::channel::<ClipEvent>();
     let opts = MonitorOptions {
         respect_password_hints: cfg.respect_password_hints,

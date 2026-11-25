@@ -90,3 +90,42 @@ fn imp(enabled: bool, exe: &str) -> Result<String, String> {
 fn imp(_: bool, _: &str) -> Result<String, String> {
     Err("unsupported platform".into())
 }
+
+/// Windows: put "copym" in the Start menu (so Windows search finds it), pointing
+/// at this exe. Rewritten on every daemon start, which also follows a moved exe.
+#[cfg(windows)]
+pub fn ensure_start_menu_shortcut() -> Result<std::path::PathBuf, String> {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, IPersistFile};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    use windows::core::{HSTRING, Interface};
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // %APPDATA%\Microsoft\Windows\Start Menu\Programs
+    let dir = dirs::data_dir().ok_or("no APPDATA")?.join(r"Microsoft\Windows\Start Menu\Programs");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("copym.lnk");
+    let e = |e: windows::core::Error| e.to_string();
+    unsafe {
+        // Ok if COM is already initialised on this thread.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(e)?;
+        link.SetPath(&HSTRING::from(exe.as_os_str())).map_err(e)?;
+        link.SetArguments(&HSTRING::from("show")).map_err(e)?;
+        if let Some(parent) = exe.parent() {
+            link.SetWorkingDirectory(&HSTRING::from(parent.as_os_str())).map_err(e)?;
+        }
+        link.SetDescription(&HSTRING::from("copym 剪贴板历史")).map_err(e)?;
+        link.SetIconLocation(&HSTRING::from(exe.as_os_str()), 0).map_err(e)?;
+        let file: IPersistFile = link.cast().map_err(e)?;
+        file.Save(&HSTRING::from(path.as_os_str()), true).map_err(e)?;
+    }
+    Ok(path)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    #[test]
+    fn start_menu_shortcut() {
+        let path = super::ensure_start_menu_shortcut().unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 0, "{}", path.display());
+    }
+}

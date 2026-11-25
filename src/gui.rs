@@ -240,6 +240,10 @@ fn restore_focus(prev: Option<&str>) {
 
 // ------------------------------------------------------------------ fonts --
 
+/// Key symbols (⌘ ⇧ ⌥ ⌃ ⏎ ⌫ ⎋ arrows) subset from Adwaita Sans (OFL-1.1, see
+/// assets/fonts). macOS system fonts lack ⏎/⇧/⌥ and egui drew them as boxes.
+static SYMBOLS_FONT: &[u8] = include_bytes!("../assets/fonts/copym-symbols.ttf");
+
 /// egui's bundled fonts have no CJK glyphs; add a system font as fallback.
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
@@ -251,7 +255,17 @@ fn install_fonts(ctx: &egui::Context) {
         fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "system-cjk".into());
         fonts.families.entry(FontFamily::Monospace).or_default().push("system-cjk".into());
     }
+    add_symbols(&mut fonts);
     ctx.set_fonts(fonts);
+}
+
+/// First in every family, so keycaps look the same on every platform (the
+/// font has no other glyphs).
+fn add_symbols(fonts: &mut FontDefinitions) {
+    fonts.font_data.insert("copym-symbols".into(), Arc::new(FontData::from_static(SYMBOLS_FONT)));
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        fonts.families.entry(family).or_default().insert(0, "copym-symbols".into());
+    }
 }
 
 fn find_cjk_font() -> Option<(Vec<u8>, u32)> {
@@ -2367,6 +2381,22 @@ fn human_size(b: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without a system font that has them (macOS), ⏎ ⇧ ⌥ used to render as boxes.
+    #[test]
+    fn key_symbols_have_glyphs() {
+        let keys = "⌘⇧⌥⌃⏎⌫⎋↑↓";
+        let check = |fonts: FontDefinitions| {
+            let ctx = egui::Context::default();
+            ctx.set_fonts(fonts);
+            let _ = ctx.run_ui(Default::default(), |_| {});
+            ctx.fonts_mut(|f| f.has_glyphs(&FontId::proportional(13.0), keys))
+        };
+        assert!(!check(FontDefinitions::default()), "egui's own fonts lack them");
+        let mut fonts = FontDefinitions::default();
+        add_symbols(&mut fonts);
+        assert!(check(fonts));
+    }
 
     #[test]
     fn civil_dates() {
