@@ -238,7 +238,7 @@ fn open_window(
 
 /// Fonts, theme and widget style (once per egui context).
 fn setup_ctx(ctx: &egui::Context, cfg: &Config) {
-    install_fonts(ctx);
+    install_fonts(ctx, &cfg.font);
     match cfg.theme.as_str() {
         "dark" => ctx.set_theme(egui::ThemePreference::Dark),
         "light" => ctx.set_theme(egui::ThemePreference::Light),
@@ -304,17 +304,19 @@ fn restore_focus(prev: Option<&str>) {
 // ------------------------------------------------------------------ fonts --
 
 /// Key symbols (⌘ ⇧ ⌥ ⌃ ⏎ ⌫ ⎋ arrows) subset from Adwaita Sans (OFL-1.1, see
-/// assets/fonts). macOS system fonts lack ⏎/⇧/⌥ and egui drew them as boxes.
+/// assets/fonts). System fonts lack some of them (⏎ ⇧ ⌥ on macOS) and egui drew them as boxes.
 static SYMBOLS_FONT: &[u8] = include_bytes!("../assets/fonts/copym-symbols.ttf");
 
-/// egui's bundled fonts have no CJK glyphs; add a system font as fallback.
-fn install_fonts(ctx: &egui::Context) {
+/// UI font: `font` from the config, else the platform's own UI font with CJK
+/// (PingFang SC, Microsoft YaHei UI, fontconfig's sans-serif for zh-cn).
+/// egui's bundled fonts stay as fallback (they have no CJK glyphs).
+fn install_fonts(ctx: &egui::Context, custom: &str) {
     let mut fonts = FontDefinitions::default();
-    if let Some((bytes, index)) = find_cjk_font() {
+    if let Some((bytes, index)) = find_ui_font(custom) {
         let mut data = FontData::from_owned(bytes);
         data.index = index;
         fonts.font_data.insert("system-cjk".into(), Arc::new(data));
-        // Proportional: CJK font first (modern UI look, consistent metrics).
+        // Proportional: this font first (native look, consistent metrics).
         fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "system-cjk".into());
         fonts.families.entry(FontFamily::Monospace).or_default().push("system-cjk".into());
     }
@@ -331,8 +333,51 @@ fn add_symbols(fonts: &mut FontDefinitions) {
     }
 }
 
-fn find_cjk_font() -> Option<(Vec<u8>, u32)> {
-    let mut candidates: Vec<(String, u32)> = Vec::new();
+/// A font file and the PostScript name of the face to use inside a collection
+/// (None: the given index).
+struct FontFile {
+    path: std::path::PathBuf,
+    face: Option<&'static str>,
+    index: u32,
+}
+
+impl FontFile {
+    fn new(path: impl Into<std::path::PathBuf>, face: Option<&'static str>) -> Self {
+        Self { path: path.into(), face, index: 0 }
+    }
+
+    fn load(&self) -> Option<(Vec<u8>, u32)> {
+        let bytes = std::fs::read(&self.path).ok()?;
+        let index = match self.face {
+            Some(name) => face_index(&bytes, name)?,
+            None => self.index,
+        };
+        // only fonts egui can actually read
+        skrifa::FontRef::from_index(&bytes, index).ok()?;
+        Some((bytes, index))
+    }
+}
+
+/// Index of the face with this PostScript name in a font file or collection.
+fn face_index(bytes: &[u8], postscript: &str) -> Option<u32> {
+    use skrifa::{raw::FileRef, string::StringId, MetadataProvider};
+    let file = FileRef::new(bytes).ok()?;
+    file.fonts().enumerate().find_map(|(i, font)| {
+        let name = font.ok()?.localized_strings(StringId::POSTSCRIPT_NAME).english_or_first()?.to_string();
+        (name == postscript).then_some(i as u32)
+    })
+}
+
+fn find_ui_font(custom: &str) -> Option<(Vec<u8>, u32)> {
+    let mut candidates: Vec<FontFile> = Vec::new();
+    let custom = custom.trim();
+    if !custom.is_empty() {
+        let path = match custom.strip_prefix("~/").zip(dirs::home_dir()) {
+            Some((rest, home)) => home.join(rest),
+            None => custom.into(),
+        };
+        candidates.push(FontFile::new(path, None));
+    }
     #[cfg(target_os = "linux")]
     if let Ok(out) = std::process::Command::new("fc-match").args(["-f", "%{file}\n%{index}", "sans-serif:lang=zh-cn"]).output() {
         let s = String::from_utf8_lossy(&out.stdout);
@@ -340,10 +385,7 @@ fn find_cjk_font() -> Option<(Vec<u8>, u32)> {
         if let Some(file) = it.next() {
             // fontconfig encodes variable-font named instances in the high 16 bits.
             let index = it.next().and_then(|i| i.trim().parse::<u32>().ok()).unwrap_or(0) & 0xFFFF;
-            let lower = file.to_lowercase();
-            if [".ttf", ".ttc", ".otf", ".otc"].iter().any(|e| lower.ends_with(e)) {
-                candidates.push((file.to_string(), index));
-            }
+            candidates.push(FontFile { index, ..FontFile::new(file, None) });
         }
     }
     #[cfg(target_os = "linux")]
@@ -354,27 +396,49 @@ fn find_cjk_font() -> Option<(Vec<u8>, u32)> {
             "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
         ]
-        .map(|p| (p.to_string(), 0)),
+        .map(|p| FontFile::new(p, None)),
     );
     #[cfg(windows)]
     {
-        let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
-        for f in ["msyh.ttc", "msyh.ttf", "msjh.ttc", "YuGothR.ttc", "malgun.ttf", "simsun.ttc"] {
-            candidates.push((format!("{windir}\\Fonts\\{f}"), 0));
-        }
+        let dir = std::path::PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into())).join("Fonts");
+        // Microsoft YaHei UI is the second face of msyh.ttc (the first one has
+        // taller line metrics meant for documents).
+        candidates.push(FontFile::new(dir.join("msyh.ttc"), Some("MicrosoftYaHeiUI")));
+        candidates.extend(["msyh.ttc", "msyh.ttf", "msjh.ttc", "YuGothR.ttc", "malgun.ttf", "simsun.ttc"].map(|f| FontFile::new(dir.join(f), None)));
     }
     #[cfg(target_os = "macos")]
-    candidates.extend(
-        [
-            "/System/Library/Fonts/PingFang.ttc",
-            "/System/Library/Fonts/Hiragino Sans GB.ttc",
-            "/System/Library/Fonts/STHeiti Medium.ttc",
-            "/System/Library/Fonts/STHeiti Light.ttc",
-            "/Library/Fonts/Arial Unicode.ttf",
-        ]
-        .map(|p| (p.to_string(), 0)),
-    );
-    candidates.into_iter().find_map(|(p, i)| std::fs::read(&p).ok().map(|b| (b, i)))
+    {
+        // Since macOS 11 PingFang lives in a hidden asset directory; Core Text knows where.
+        for name in ["PingFangSC-Regular", ".PingFangSC-Regular"] {
+            if let Some(path) = mac::font_path(name) {
+                candidates.push(FontFile::new(path, Some("PingFangSC-Regular")));
+            }
+        }
+        candidates.push(FontFile::new("/System/Library/Fonts/PingFang.ttc", Some("PingFangSC-Regular")));
+        candidates.extend(
+            [
+                "/System/Library/Fonts/Hiragino Sans GB.ttc",
+                "/System/Library/Fonts/STHeiti Medium.ttc",
+                "/System/Library/Fonts/STHeiti Light.ttc",
+                "/Library/Fonts/Arial Unicode.ttf",
+            ]
+            .map(|p| FontFile::new(p, None)),
+        );
+    }
+    candidates.iter().find_map(FontFile::load)
+}
+
+#[cfg(target_os = "macos")]
+mod mac {
+    use objc2_core_foundation::{CFString, CFURL};
+    use objc2_core_text::{kCTFontURLAttribute, CTFont};
+
+    /// File of the installed font with this PostScript name.
+    pub fn font_path(postscript: &str) -> Option<std::path::PathBuf> {
+        let font = unsafe { CTFont::with_name(&CFString::from_str(postscript), 13.0, std::ptr::null()) };
+        let url = unsafe { font.attribute(kCTFontURLAttribute) }?.downcast::<CFURL>().ok()?;
+        url.to_file_path()
+    }
 }
 
 // ---------------------------------------------------------------- palette --
@@ -493,6 +557,7 @@ struct App {
     ocr_available: bool,
     sync: Option<SyncInfo>,
     sync_open: bool,
+    ignore: Option<IgnoreDialog>,
     sync_polled: Option<Instant>,
     sync_input: String,
     /// (text, is_error)
@@ -542,6 +607,9 @@ enum Act {
     Pause,
     Sync,
     Groups,
+    /// Stop recording copies from this app.
+    IgnoreApp(String),
+    IgnoredApps,
     Autostart,
     Settings,
     Quit,
@@ -550,6 +618,13 @@ enum Act {
 enum PanelRow {
     Title(String),
     Act(Act, String, String),
+}
+
+/// State of the "ignored apps" dialog.
+#[derive(Default)]
+struct IgnoreDialog {
+    input: String,
+    msg: Option<(String, bool)>,
 }
 
 /// State of the "manage groups" dialog.
@@ -638,6 +713,7 @@ impl App {
             ocr_available: false,
             sync: None,
             sync_open: false,
+            ignore: None,
             sync_polled: None,
             sync_input: String::new(),
             sync_msg: None,
@@ -855,7 +931,7 @@ impl App {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) -> Option<Action> {
-        if self.sync_open || self.editor.is_some() {
+        if self.sync_open || self.editor.is_some() || self.ignore.is_some() {
             return None; // dialogs own the keyboard
         }
         if self.actions.is_some() {
@@ -1087,11 +1163,15 @@ impl App {
             }
             rows.push(PanelRow::Act(Act::Pin, if m.pinned { "取消固定" } else { "固定" }.into(), format!("{cmd}S")));
             rows.push(PanelRow::Act(Act::Delete, "删除".into(), format!("{cmd}D")));
+            if let Some(app) = m.source.as_deref().filter(|a| self.is_local_app(a)) {
+                rows.push(PanelRow::Act(Act::IgnoreApp(app.to_string()), format!("不再记录「{app}」的复制"), String::new()));
+            }
         }
         rows.push(PanelRow::Title("copym".into()));
         rows.push(PanelRow::Act(Act::Pause, if self.paused { "继续记录剪贴板" } else { "暂停记录剪贴板" }.into(), String::new()));
         rows.push(PanelRow::Act(Act::Sync, "局域网同步…".into(), String::new()));
         rows.push(PanelRow::Act(Act::Groups, "管理分组…".into(), String::new()));
+        rows.push(PanelRow::Act(Act::IgnoredApps, "不记录的应用…".into(), String::new()));
         rows.push(PanelRow::Act(Act::Autostart, if self.autostart { "关闭登录时自动启动" } else { "登录时自动启动" }.into(), String::new()));
         rows.push(PanelRow::Act(Act::Settings, "打开设置文件".into(), String::new()));
         rows.push(PanelRow::Act(Act::Quit, "退出 copym".into(), format!("{cmd}Q")));
@@ -1172,6 +1252,17 @@ impl App {
                 self.refresh_sync();
             }
             Act::Groups => self.editor = Some(Editor::new(&self.groups, self.group)),
+            Act::IgnoreApp(app) => {
+                let mut apps = self.cfg.ignore_apps.clone();
+                apps.push(app.clone());
+                if self.set_ignored(apps) {
+                    self.notify(format!("不再记录「{app}」的复制（可在“不记录的应用…”里恢复）"));
+                } else {
+                    let e = self.error.take().unwrap_or_default();
+                    self.notify(format!("设置失败：{e}"));
+                }
+            }
+            Act::IgnoredApps => self.ignore = Some(IgnoreDialog::default()),
             Act::Autostart => match crate::autostart::set(!self.autostart) {
                 Ok(_) => {
                     self.autostart = !self.autostart;
@@ -1224,7 +1315,7 @@ impl App {
             if r.has_focus() || r.clicked() {
                 self.search_mode = true;
             }
-            if self.search_mode && !self.sync_open && self.editor.is_none() && self.actions.is_none() {
+            if self.search_mode && !self.sync_open && self.editor.is_none() && self.ignore.is_none() && self.actions.is_none() {
                 r.request_focus();
             }
         });
@@ -1239,7 +1330,16 @@ impl App {
 
     /// "全部 ⌄" button opening the list of groups (like Raycast's type filter).
     fn group_dropdown(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        let name = self.groups.list.get(self.group).map(|g| g.name.clone()).unwrap_or_default();
+        let full = self.groups.list.get(self.group).map(|g| g.name.clone()).unwrap_or_default();
+        // long names would squeeze the search field
+        let mut name = full.clone();
+        let width = |t: &str| ui.painter().layout_no_wrap(t.to_string(), FontId::proportional(13.0), pal.dim).size().x;
+        if width(&name) > 180.0 {
+            while !name.is_empty() && width(&format!("{name}…")) > 180.0 {
+                name.pop();
+            }
+            name.push('…');
+        }
         let resp = ui
             .add(
                 egui::Button::new(RichText::new(format!("{name}    ")).size(13.0).color(pal.dim))
@@ -1248,7 +1348,7 @@ impl App {
                     .corner_radius(7)
                     .min_size(Vec2::new(0.0, 28.0)),
             )
-            .on_hover_text(format!("分组（{KEY_GROUP}1…9 / Tab 切换）"));
+            .on_hover_text(format!("{full}\n分组（{KEY_GROUP}1…9 / Tab 切换）"));
         // chevron
         let r = resp.rect;
         let c = Pos2::new(r.right() - 14.0, r.center().y);
@@ -1490,11 +1590,16 @@ impl App {
         });
         rows.push(("大小", human_size(meta.bytes)));
         rows.push(("复制时间", abs_time(meta.created, self.tz)));
-        let meta_h = 30.0 + rows.len() as f32 * 25.0;
+        let mut meta_h = 30.0 + rows.len() as f32 * 25.0;
 
         egui::Frame::new().inner_margin(Margin { left: 16, right: 16, top: 14, bottom: 8 }).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             ui.spacing_mut().item_spacing.y = 0.0; // rows below are measured exactly
+            // a short window: the content wins, the info table goes
+            let show_meta = ui.available_height() >= meta_h + 120.0;
+            if !show_meta {
+                meta_h = 0.0;
+            }
             let body = Vec2::new(ui.available_width(), (ui.available_height() - meta_h).max(60.0));
             ui.allocate_ui_with_layout(body, Layout::top_down(Align::LEFT), |ui| {
                 ui.set_min_size(body);
@@ -1502,6 +1607,9 @@ impl App {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 self.preview_body(ui, pal, &meta, kind);
             });
+            if !show_meta {
+                return;
+            }
             // metadata
             let w = ui.available_width();
             let (title, _) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::hover());
@@ -1510,8 +1618,9 @@ impl App {
             for (k, v) in rows {
                 let (r, _) = ui.allocate_exact_size(Vec2::new(w, 25.0), Sense::hover());
                 let p = ui.painter();
-                p.text(r.left_center(), Align2::LEFT_CENTER, k, FontId::proportional(12.0), pal.dim);
-                p.text(r.right_center(), Align2::RIGHT_CENTER, v, FontId::proportional(12.0), pal.text);
+                let key = p.text(r.left_center(), Align2::LEFT_CENTER, k, FontId::proportional(12.0), pal.dim);
+                let value = elided(p, &v, FontId::proportional(12.0), pal.text, r.right() - key.right() - 16.0);
+                p.galley(Pos2::new(r.right() - value.size().x, r.center().y - value.size().y / 2.0), value, pal.text);
                 p.hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, pal.border.gamma_multiply(0.6)));
             }
         });
@@ -1635,113 +1744,248 @@ impl App {
         let modal = egui::Modal::new(egui::Id::unique("sync-panel"))
             .frame(dialog_frame(pal))
             .show(ctx, |ui| {
-                ui.set_width(420.0);
-                ui.label(RichText::new("局域网同步").size(16.0).strong().color(pal.text));
-                ui.label(RichText::new("端到端加密 · 仅同一局域网 · 收到的内容只进入历史，不会改动剪贴板").size(11.5).color(pal.faint));
-                ui.add_space(8.0);
-                let Some(info) = info else {
-                    ui.label(RichText::new("无法获取同步状态").color(pal.danger));
-                    return;
-                };
-                if !info.enabled {
-                    ui.label(RichText::new("同步已在设置中关闭（sync_enabled = false）").color(pal.dim));
-                    return;
-                }
-                section(ui, pal, |ui| {
-                    ui.label(RichText::new(format!("本机：{}", info.device_name)).color(pal.text));
-                    if info.paired {
-                        if info.peers.is_empty() {
-                            ui.label(RichText::new("暂无设备在线（已配对的设备在同一局域网时会自动连接）").size(12.0).color(pal.faint));
-                        } else {
-                            for (name, addr) in &info.peers {
-                                ui.horizontal(|ui| {
-                                    let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                                    ui.painter().circle_filled(r.center(), 4.0, pal.ok);
-                                    ui.label(RichText::new(name).size(13.0).color(pal.text));
-                                    ui.label(RichText::new(addr).size(11.5).color(pal.faint));
-                                });
+                let (w, h) = dialog_room(ctx, 420.0);
+                ui.set_width(w);
+                egui::ScrollArea::vertical().max_height(h).auto_shrink([false, true]).show(ui, |ui| {
+                    ui.label(RichText::new("局域网同步").size(16.0).strong().color(pal.text));
+                    ui.label(RichText::new("端到端加密 · 仅同一局域网 · 收到的内容只进入历史，不会改动剪贴板").size(11.5).color(pal.faint));
+                    ui.add_space(8.0);
+                    let Some(info) = info else {
+                        ui.label(RichText::new("无法获取同步状态").color(pal.danger));
+                        return;
+                    };
+                    if !info.enabled {
+                        ui.label(RichText::new("同步已在设置中关闭（sync_enabled = false）").color(pal.dim));
+                        return;
+                    }
+                    section(ui, pal, |ui| {
+                        ui.label(RichText::new(format!("本机：{}", info.device_name)).color(pal.text));
+                        if info.paired {
+                            if info.peers.is_empty() {
+                                ui.label(RichText::new("暂无设备在线（已配对的设备在同一局域网时会自动连接）").size(12.0).color(pal.faint));
+                            } else {
+                                for (name, addr) in &info.peers {
+                                    ui.horizontal(|ui| {
+                                        let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                                        ui.painter().circle_filled(r.center(), 4.0, pal.ok);
+                                        ui.label(RichText::new(name).size(13.0).color(pal.text));
+                                        ui.label(RichText::new(addr).size(11.5).color(pal.faint));
+                                    });
+                                }
                             }
+                        } else {
+                            ui.label(RichText::new("尚未与其他设备配对").size(12.0).color(pal.faint));
                         }
-                    } else {
-                        ui.label(RichText::new("尚未与其他设备配对").size(12.0).color(pal.faint));
-                    }
-                });
-                ui.add_space(8.0);
+                    });
+                    ui.add_space(8.0);
 
-                // Invite another device.
-                if let Some((code, addrs)) = self.sync_pairing.clone() {
-                    ui.label(RichText::new("在另一台设备的 copym 里输入配对码：").size(12.5).color(pal.dim));
-                    ui.label(RichText::new(&code).monospace().size(30.0).strong().color(pal.accent));
-                    if let Some(a) = addrs.first() {
-                        ui.label(RichText::new(format!("找不到本机时，输入 {code}@{a}")).size(11.5).color(pal.faint));
-                    }
-                    ui.label(RichText::new("3 分钟内有效，只能尝试一次").size(11.5).color(pal.faint));
-                } else if ui.add(primary_button(pal, "添加设备（生成配对码）")).clicked() {
-                    match self.req(&Request::SyncPair) {
-                        Some(Response::Pairing { code, addrs, .. }) => {
-                            self.sync_pairing = Some((code, addrs));
-                            self.sync_msg = None;
+                    // Invite another device.
+                    if let Some((code, addrs)) = self.sync_pairing.clone() {
+                        ui.label(RichText::new("在另一台设备的 copym 里输入配对码：").size(12.5).color(pal.dim));
+                        ui.label(RichText::new(&code).monospace().size(30.0).strong().color(pal.accent));
+                        if let Some(a) = addrs.first() {
+                            ui.label(RichText::new(format!("找不到本机时，输入 {code}@{a}")).size(11.5).color(pal.faint));
                         }
-                        _ => self.sync_msg = Some((self.error.take().unwrap_or_else(|| "无法开始配对".into()), true)),
-                    }
-                    self.refresh_sync();
-                }
-                ui.add_space(10.0);
-
-                // Join another device.
-                ui.label(RichText::new("加入另一台设备").size(12.5).color(pal.dim));
-                ui.horizontal(|ui| {
-                    let busy = self.sync_job.is_some();
-                    ui.add_enabled(
-                        !busy,
-                        egui::TextEdit::singleline(&mut self.sync_input).hint_text("8 位配对码，可附 @IP:端口").desired_width(270.0).margin(Margin::symmetric(8, 5)),
-                    );
-                    let label = if busy { "正在配对…" } else { "加入" };
-                    if ui.add_enabled(!busy && !self.sync_input.trim().is_empty(), egui::Button::new(label)).clicked() {
-                        let input = self.sync_input.trim().to_string();
-                        let (code, addr) = match input.split_once('@') {
-                            Some((c, a)) => (c.to_string(), Some(a.to_string())),
-                            None => (input, None),
-                        };
-                        let (tx, rx) = mpsc::channel();
-                        self.sync_job = Some(rx);
-                        std::thread::spawn(move || {
-                            let res = Client::connect()
-                                .map_err(|e| e.to_string())
-                                .and_then(|mut c| c.request(&Request::SyncJoin { code, addr }).map_err(|e| e.to_string()))
-                                .and_then(|r| match r {
-                                    Response::Joined { name } => Ok(name),
-                                    Response::Err(e) => Err(e),
-                                    _ => Err("unexpected response".into()),
-                                });
-                            let _ = tx.send(res);
-                        });
-                    }
-                });
-
-                if let Some((msg, err)) = &self.sync_msg {
-                    ui.add_space(4.0);
-                    ui.label(RichText::new(msg).size(12.5).color(if *err { pal.danger } else { pal.ok }));
-                }
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if info.paired
-                        && ui.add(egui::Button::new(RichText::new("退出同步组").color(pal.danger))).on_hover_text("忘记同步密钥并断开所有设备").clicked()
-                    {
-                        self.req(&Request::SyncLeave);
-                        self.sync_pairing = None;
-                        self.sync_msg = Some(("已退出同步组".into(), false));
+                        ui.label(RichText::new("3 分钟内有效，只能尝试一次").size(11.5).color(pal.faint));
+                    } else if ui.add(primary_button(pal, "添加设备（生成配对码）")).clicked() {
+                        match self.req(&Request::SyncPair) {
+                            Some(Response::Pairing { code, addrs, .. }) => {
+                                self.sync_pairing = Some((code, addrs));
+                                self.sync_msg = None;
+                            }
+                            _ => self.sync_msg = Some((self.error.take().unwrap_or_else(|| "无法开始配对".into()), true)),
+                        }
                         self.refresh_sync();
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("关闭").clicked() {
-                            self.sync_open = false;
+                    ui.add_space(10.0);
+
+                    // Join another device.
+                    ui.label(RichText::new("加入另一台设备").size(12.5).color(pal.dim));
+                    ui.horizontal(|ui| {
+                        let busy = self.sync_job.is_some();
+                        ui.add_enabled(
+                            !busy,
+                            egui::TextEdit::singleline(&mut self.sync_input).hint_text("8 位配对码，可附 @IP:端口").desired_width(270.0).margin(Margin::symmetric(8, 5)),
+                        );
+                        let label = if busy { "正在配对…" } else { "加入" };
+                        if ui.add_enabled(!busy && !self.sync_input.trim().is_empty(), egui::Button::new(label)).clicked() {
+                            let input = self.sync_input.trim().to_string();
+                            let (code, addr) = match input.split_once('@') {
+                                Some((c, a)) => (c.to_string(), Some(a.to_string())),
+                                None => (input, None),
+                            };
+                            let (tx, rx) = mpsc::channel();
+                            self.sync_job = Some(rx);
+                            std::thread::spawn(move || {
+                                let res = Client::connect()
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|mut c| c.request(&Request::SyncJoin { code, addr }).map_err(|e| e.to_string()))
+                                    .and_then(|r| match r {
+                                        Response::Joined { name } => Ok(name),
+                                        Response::Err(e) => Err(e),
+                                        _ => Err("unexpected response".into()),
+                                    });
+                                let _ = tx.send(res);
+                            });
                         }
+                    });
+
+                    if let Some((msg, err)) = &self.sync_msg {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(msg).size(12.5).color(if *err { pal.danger } else { pal.ok }));
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if info.paired
+                            && ui.add(egui::Button::new(RichText::new("退出同步组").color(pal.danger))).on_hover_text("忘记同步密钥并断开所有设备").clicked()
+                        {
+                            self.req(&Request::SyncLeave);
+                            self.sync_pairing = None;
+                            self.sync_msg = Some(("已退出同步组".into(), false));
+                            self.refresh_sync();
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("关闭").clicked() {
+                                self.sync_open = false;
+                            }
+                        });
                     });
                 });
             });
         if modal.should_close() {
             self.sync_open = false;
+        }
+    }
+
+    /// A source that is an app on this machine (synced items carry the device name).
+    fn is_local_app(&self, source: &str) -> bool {
+        let lower = source.to_lowercase();
+        let ignored = self.cfg.ignore_apps.iter().any(|a| !a.trim().is_empty() && lower.contains(&a.trim().to_lowercase()));
+        let peer = self.sync.as_ref().is_some_and(|s| s.peers.iter().any(|(n, _)| n == source));
+        !ignored && !peer
+    }
+
+    /// Save `ignore_apps` through the daemon (it applies them right away).
+    fn set_ignored(&mut self, mut apps: Vec<String>) -> bool {
+        apps.retain(|a| !a.trim().is_empty());
+        apps.dedup();
+        if self.req(&Request::SetIgnoredApps { apps: apps.clone() }).is_none() {
+            return false;
+        }
+        self.cfg.ignore_apps = apps;
+        true
+    }
+
+    fn ignore_panel(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some(mut dlg) = self.ignore.take() else { return };
+        if self.sync.is_none() {
+            self.refresh_sync(); // to tell synced devices from apps
+        }
+        let mut keep = true;
+        let mut apps = self.cfg.ignore_apps.clone();
+        let mut changed = false;
+        // apps seen in the history, newest first
+        let mut recent: Vec<String> = Vec::new();
+        for m in &self.items {
+            if let Some(a) = m.source.as_deref().filter(|a| self.is_local_app(a)) {
+                if !recent.iter().any(|r| r == a) {
+                    recent.push(a.to_string());
+                }
+            }
+        }
+        recent.truncate(12);
+        let modal = egui::Modal::new(egui::Id::unique("ignore-apps")).frame(dialog_frame(pal)).show(ctx, |ui| {
+            let (w, h) = dialog_room(ctx, 440.0);
+            ui.set_width(w);
+            ui.label(RichText::new("不记录的应用").size(16.0).strong().color(pal.text));
+            let hint = if cfg!(target_os = "linux") {
+                "Linux 上无法得知是哪个应用复制的，这里的设置不生效；可以用 ignore_patterns 按内容排除"
+            } else {
+                "从这些应用复制的内容不会进入历史。按名称包含匹配，不区分大小写，立即生效"
+            };
+            ui.label(RichText::new(hint).size(11.5).color(pal.faint));
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical().max_height((h - 190.0).max(80.0)).auto_shrink([false, true]).show(ui, |ui| {
+                section(ui, pal, |ui| {
+                    if apps.is_empty() {
+                        ui.label(RichText::new("（没有）").size(12.5).color(pal.faint));
+                    }
+                    let mut remove = None;
+                    for (i, a) in apps.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(a).size(13.0).color(pal.text));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.small_button("移除").clicked() {
+                                    remove = Some(i);
+                                }
+                            });
+                        });
+                    }
+                    if let Some(i) = remove {
+                        apps.remove(i);
+                        changed = true;
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let add_w = 64.0;
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut dlg.input)
+                        .hint_text(if cfg!(windows) { "应用名或进程名，例：chrome.exe" } else { "应用名，例：微信" })
+                        .desired_width(ui.available_width() - add_w - 8.0)
+                        .margin(Margin::symmetric(8, 4)),
+                );
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                if (ui.add_enabled(!dlg.input.trim().is_empty(), egui::Button::new("添加").min_size(Vec2::new(add_w, 0.0))).clicked() || enter)
+                    && !dlg.input.trim().is_empty()
+                {
+                    apps.push(dlg.input.trim().to_string());
+                    dlg.input.clear();
+                    changed = true;
+                }
+            });
+            if !recent.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new("最近复制过的应用（点击添加）").size(12.0).color(pal.dim));
+                ui.horizontal_wrapped(|ui| {
+                    for a in &recent {
+                        if ui.small_button(format!("＋ {a}")).clicked() {
+                            apps.push(a.clone());
+                            changed = true;
+                        }
+                    }
+                });
+            }
+            if let Some((msg, err)) = &dlg.msg {
+                ui.add_space(4.0);
+                ui.label(RichText::new(msg).size(12.0).color(if *err { pal.danger } else { pal.ok }));
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("恢复默认").on_hover_text("常见的密码管理器").clicked() {
+                    apps = Config::default().ignore_apps;
+                    changed = true;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("关闭").clicked() {
+                        keep = false;
+                    }
+                });
+            });
+        });
+        if changed {
+            dlg.msg = Some(if self.set_ignored(apps) {
+                ("已保存".into(), false)
+            } else {
+                (format!("保存失败：{}", self.error.take().unwrap_or_default()), true)
+            });
+        }
+        if modal.should_close() {
+            keep = false;
+        }
+        if keep {
+            self.ignore = Some(dlg);
         }
     }
 
@@ -1760,7 +2004,8 @@ impl App {
         let mut saved = false;
         const BODY_H: f32 = 296.0;
         let modal = egui::Modal::new(egui::Id::unique("group-editor")).frame(dialog_frame(pal).inner_margin(Margin::same(16))).show(ctx, |ui| {
-            ui.set_width(560.0);
+            let (w, h) = dialog_room(ctx, 560.0);
+            ui.set_width(w);
             ui.spacing_mut().item_spacing.y = 5.0;
             ui.label(RichText::new("管理分组").size(16.0).strong().color(pal.text));
             ui.label(
@@ -1769,132 +2014,136 @@ impl App {
                     .color(pal.faint),
             );
             ui.add_space(8.0);
-            ui.horizontal_top(|ui| {
-                // ---- left: list of groups
-                ui.allocate_ui_with_layout(Vec2::new(150.0, BODY_H), Layout::top_down(Align::LEFT), |ui| {
-                    ui.set_min_size(Vec2::new(150.0, BODY_H));
-                    let mut select = None;
-                    egui::ScrollArea::vertical().id_salt("ged-list").max_height(BODY_H - 70.0).show(ui, |ui| {
-                        ui.with_layout(Layout::top_down_justified(Align::LEFT), |ui| {
-                            ui.set_width(146.0);
-                            for (i, g) in ed.draft.list.iter().enumerate() {
-                                let mut label = if i < 9 { format!("{}   {}", i + 1, g.name) } else { format!("     {}", g.name) };
-                                if ed.draft.default == g.name {
-                                    label.push_str("  · 默认");
+            // title and buttons stay; the body scrolls when the window is short
+            egui::ScrollArea::vertical().id_salt("ged-body").max_height((h - 100.0).max(120.0)).auto_shrink([false, true]).show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    // ---- left: list of groups
+                    ui.allocate_ui_with_layout(Vec2::new(150.0, BODY_H), Layout::top_down(Align::LEFT), |ui| {
+                        ui.set_min_size(Vec2::new(150.0, BODY_H));
+                        let mut select = None;
+                        egui::ScrollArea::vertical().id_salt("ged-list").max_height(BODY_H - 70.0).show(ui, |ui| {
+                            ui.with_layout(Layout::top_down_justified(Align::LEFT), |ui| {
+                                ui.set_width(146.0);
+                                for (i, g) in ed.draft.list.iter().enumerate() {
+                                    let mut label = if i < 9 { format!("{}   {}", i + 1, g.name) } else { format!("     {}", g.name) };
+                                    if ed.draft.default == g.name {
+                                        label.push_str("  · 默认");
+                                    }
+                                                    let button = egui::Button::selectable(i == ed.sel, label).min_size(Vec2::new(146.0, 26.0)).truncate();
+                                    if ui.add(button).on_hover_text(&g.name).clicked() {
+                                        select = Some(i);
+                                    }
                                 }
-                                if ui.add(egui::Button::selectable(i == ed.sel, label).min_size(Vec2::new(146.0, 26.0))).clicked() {
-                                    select = Some(i);
-                                }
+                            });
+                        });
+                        if let Some(i) = select {
+                            ed.select(i);
+                        }
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            if ui.small_button("＋ 新建").clicked() {
+                                ed.store_bufs();
+                                let n = ed.draft.list.len() + 1;
+                                ed.draft.list.push(GroupDef { name: format!("分组 {n}"), ..Default::default() });
+                                ed.sel = ed.draft.list.len() - 1;
+                                ed.load_bufs();
+                            }
+                            let can_delete = ed.draft.list.len() > 1;
+                            if ui.add_enabled(can_delete, egui::Button::new("删除").small()).clicked() {
+                                ed.draft.list.remove(ed.sel);
+                                ed.sel = ed.sel.min(ed.draft.list.len() - 1);
+                                ed.load_bufs();
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            if ui.add_enabled(ed.sel > 0, egui::Button::new("上移").small()).clicked() {
+                                ed.store_bufs();
+                                ed.draft.list.swap(ed.sel, ed.sel - 1);
+                                ed.sel -= 1;
+                            }
+                            if ui.add_enabled(ed.sel + 1 < ed.draft.list.len(), egui::Button::new("下移").small()).clicked() {
+                                ed.store_bufs();
+                                ed.draft.list.swap(ed.sel, ed.sel + 1);
+                                ed.sel += 1;
                             }
                         });
                     });
-                    if let Some(i) = select {
-                        ed.select(i);
-                    }
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        if ui.small_button("＋ 新建").clicked() {
-                            ed.store_bufs();
-                            let n = ed.draft.list.len() + 1;
-                            ed.draft.list.push(GroupDef { name: format!("分组 {n}"), ..Default::default() });
-                            ed.sel = ed.draft.list.len() - 1;
-                            ed.load_bufs();
+                    let (line, _) = ui.allocate_exact_size(Vec2::new(1.0, BODY_H), Sense::hover());
+                    ui.painter().rect_filled(line, 0, pal.border);
+                    ui.add_space(8.0);
+                    // ---- right: the selected group
+                    ui.vertical(|ui| {
+                        let sel = ed.sel;
+                        let default_name = ed.draft.default.clone();
+                        let Some(g) = ed.draft.list.get_mut(sel) else { return };
+                        let mut changed = false;
+                        let old_name = g.name.clone();
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("名称").size(12.0).color(pal.dim));
+                            changed |= ui.add(egui::TextEdit::singleline(&mut g.name).desired_width(f32::INFINITY).margin(Margin::symmetric(8, 4))).changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("内容类型").size(12.0).color(pal.dim));
+                            for (v, l) in [("", "全部"), ("text", "文本"), ("image", "图片")] {
+                                changed |= ui.selectable_value(&mut g.kind, v.to_string(), l).changed();
+                            }
+                        });
+                        changed |= ui.checkbox(&mut g.pinned, "只包含固定的条目").changed();
+                        changed |= ui
+                            .checkbox(&mut g.rest, "“其他”分组：不属于任何带规则分组的条目")
+                            .on_hover_text("排除其他所有分组的内容正则和来源应用正则所匹配的条目")
+                            .changed();
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("内容正则（每行一条，匹配任意一条即可；(?i) 忽略大小写）").size(12.0).color(pal.dim));
+                        changed |= ui
+                            .add(
+                                egui::TextEdit::multiline(&mut ed.patterns)
+                                    .font(FontId::monospace(12.5))
+                                    .desired_rows(2)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text(r"例：^\s*https?://"),
+                            )
+                            .changed();
+                        ui.label(RichText::new("来源正则：来源应用或同步设备名（每行一条，可留空）").size(12.0).color(pal.dim));
+                        changed |= ui
+                            .add(
+                                egui::TextEdit::multiline(&mut ed.apps)
+                                    .font(FontId::monospace(12.5))
+                                    .desired_rows(2)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("例：(?i)chrome|firefox"),
+                            )
+                            .changed();
+                        let g = &ed.draft.list[sel];
+                        let mut is_default = default_name == g.name;
+                        if ui.checkbox(&mut is_default, "打开弹窗时默认显示这个分组").changed() && is_default {
+                            ed.draft.default = g.name.clone();
                         }
-                        let can_delete = ed.draft.list.len() > 1;
-                        if ui.add_enabled(can_delete, egui::Button::new("删除").small()).clicked() {
-                            ed.draft.list.remove(ed.sel);
-                            ed.sel = ed.sel.min(ed.draft.list.len() - 1);
-                            ed.load_bufs();
+                        if ed.draft.default == old_name && old_name != ed.draft.list[sel].name {
+                            ed.draft.default = ed.draft.list[sel].name.clone(); // follow renames
+                        }
+                        if changed {
+                            ed.count_dirty = true;
+                            ed.error = None;
+                        }
+                        ui.add_space(4.0);
+                        let probe = GroupDef { patterns: ed.patterns.lines().map(String::from).collect(), apps: ed.apps.lines().map(String::from).collect(), ..ed.draft.list[sel].clone() };
+                        match probe.validate() {
+                            Err(e) => {
+                                ui.label(RichText::new(e).size(12.0).color(pal.danger));
+                            }
+                            Ok(()) => {
+                                let txt = match ed.count {
+                                    Some(Some(n)) => format!("当前历史中有 {n} 条属于这个分组"),
+                                    _ => String::new(),
+                                };
+                                ui.label(RichText::new(txt).size(12.0).color(pal.ok));
+                            }
                         }
                     });
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        if ui.add_enabled(ed.sel > 0, egui::Button::new("上移").small()).clicked() {
-                            ed.store_bufs();
-                            ed.draft.list.swap(ed.sel, ed.sel - 1);
-                            ed.sel -= 1;
-                        }
-                        if ui.add_enabled(ed.sel + 1 < ed.draft.list.len(), egui::Button::new("下移").small()).clicked() {
-                            ed.store_bufs();
-                            ed.draft.list.swap(ed.sel, ed.sel + 1);
-                            ed.sel += 1;
-                        }
-                    });
-                });
-                let (line, _) = ui.allocate_exact_size(Vec2::new(1.0, BODY_H), Sense::hover());
-                ui.painter().rect_filled(line, 0, pal.border);
-                ui.add_space(8.0);
-                // ---- right: the selected group
-                ui.vertical(|ui| {
-                    let sel = ed.sel;
-                    let default_name = ed.draft.default.clone();
-                    let Some(g) = ed.draft.list.get_mut(sel) else { return };
-                    let mut changed = false;
-                    let old_name = g.name.clone();
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("名称").size(12.0).color(pal.dim));
-                        changed |= ui.add(egui::TextEdit::singleline(&mut g.name).desired_width(f32::INFINITY).margin(Margin::symmetric(8, 4))).changed();
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("内容类型").size(12.0).color(pal.dim));
-                        for (v, l) in [("", "全部"), ("text", "文本"), ("image", "图片")] {
-                            changed |= ui.selectable_value(&mut g.kind, v.to_string(), l).changed();
-                        }
-                    });
-                    changed |= ui.checkbox(&mut g.pinned, "只包含固定的条目").changed();
-                    changed |= ui
-                        .checkbox(&mut g.rest, "“其他”分组：不属于任何带规则分组的条目")
-                        .on_hover_text("排除其他所有分组的内容正则和来源应用正则所匹配的条目")
-                        .changed();
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("内容正则（每行一条，匹配任意一条即可；(?i) 忽略大小写）").size(12.0).color(pal.dim));
-                    changed |= ui
-                        .add(
-                            egui::TextEdit::multiline(&mut ed.patterns)
-                                .font(FontId::monospace(12.5))
-                                .desired_rows(2)
-                                .desired_width(f32::INFINITY)
-                                .hint_text(r"例：^\s*https?://"),
-                        )
-                        .changed();
-                    ui.label(RichText::new("来源正则：来源应用或同步设备名（每行一条，可留空）").size(12.0).color(pal.dim));
-                    changed |= ui
-                        .add(
-                            egui::TextEdit::multiline(&mut ed.apps)
-                                .font(FontId::monospace(12.5))
-                                .desired_rows(2)
-                                .desired_width(f32::INFINITY)
-                                .hint_text("例：(?i)chrome|firefox"),
-                        )
-                        .changed();
-                    let g = &ed.draft.list[sel];
-                    let mut is_default = default_name == g.name;
-                    if ui.checkbox(&mut is_default, "打开弹窗时默认显示这个分组").changed() && is_default {
-                        ed.draft.default = g.name.clone();
-                    }
-                    if ed.draft.default == old_name && old_name != ed.draft.list[sel].name {
-                        ed.draft.default = ed.draft.list[sel].name.clone(); // follow renames
-                    }
-                    if changed {
-                        ed.count_dirty = true;
-                        ed.error = None;
-                    }
-                    ui.add_space(4.0);
-                    let probe = GroupDef { patterns: ed.patterns.lines().map(String::from).collect(), apps: ed.apps.lines().map(String::from).collect(), ..ed.draft.list[sel].clone() };
-                    match probe.validate() {
-                        Err(e) => {
-                            ui.label(RichText::new(e).size(12.0).color(pal.danger));
-                        }
-                        Ok(()) => {
-                            let txt = match ed.count {
-                                Some(Some(n)) => format!("当前历史中有 {n} 条属于这个分组"),
-                                _ => String::new(),
-                            };
-                            ui.label(RichText::new(txt).size(12.0).color(pal.ok));
-                        }
-                    }
-                });
+            });
             });
             if let Some(e) = &ed.error {
                 ui.label(RichText::new(e).size(12.0).color(pal.danger));
@@ -1955,25 +2204,13 @@ impl App {
         let badge = Rect::from_center_size(Pos2::new(rect.left() + 22.0, rect.center().y), Vec2::splat(18.0));
         p.rect_filled(badge, 5, pal.accent);
         p.text(badge.center(), Align2::CENTER_CENTER, "c", FontId::proportional(12.0), pal.on_accent);
-        let mut ctx_text = format!("剪贴板历史  ·  {}", self.groups.list.get(self.group).map(|g| g.name.as_str()).unwrap_or(""));
-        ctx_text.push_str(&format!("  ·  {} 条", self.items.len()));
-        if self.paused {
-            ctx_text.push_str("  ·  已暂停");
-        }
-        let left = p.text(Pos2::new(badge.right() + 8.0, rect.center().y), Align2::LEFT_CENTER, ctx_text, FontId::proportional(12.0), pal.dim);
-        if let Some(sync) = self.sync.as_ref().filter(|s| s.paired) {
-            let n = sync.peers.len();
-            let dot = Pos2::new(left.right() + 14.0, rect.center().y);
-            p.circle_filled(dot, 3.0, if n > 0 { pal.ok } else { pal.faint });
-            p.text(dot + Vec2::new(7.0, 0.0), Align2::LEFT_CENTER, format!("同步 {n} 台"), FontId::proportional(12.0), pal.dim);
-        }
 
         // right: "粘贴 ⏎ | 操作 ⌘K | ⏻"
         let inner = rect.shrink2(Vec2::new(10.0, 6.0));
         let mut open_actions = false;
         let mut copy = false;
         let mut quit = false;
-        ui.scope_builder(egui::UiBuilder::new().max_rect(inner).layout(Layout::right_to_left(Align::Center)), |ui| {
+        let buttons = ui.scope_builder(egui::UiBuilder::new().max_rect(inner).layout(Layout::right_to_left(Align::Center)), |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             let quit_key = if cfg!(target_os = "macos") { "⌘Q" } else { "Ctrl+Q" };
             if power_button(ui, pal).on_hover_text(format!("退出 copym（{quit_key}）")).clicked() {
@@ -1992,6 +2229,29 @@ impl App {
                 copy = true;
             }
         });
+
+        // left: context, cut short before the buttons
+        let p = ui.painter();
+        let mut ctx_text = format!("剪贴板历史  ·  {}", self.groups.list.get(self.group).map(|g| g.name.as_str()).unwrap_or(""));
+        ctx_text.push_str(&format!("  ·  {} 条", self.items.len()));
+        if self.paused {
+            ctx_text.push_str("  ·  已暂停");
+        }
+        let x = badge.right() + 8.0;
+        let room = buttons.response.rect.left() - 16.0;
+        let sync = self.sync.as_ref().filter(|s| s.paired).map(|s| (s.peers.len(), format!("同步 {} 台", s.peers.len())));
+        let sync_galley = sync.as_ref().map(|(_, t)| p.layout_no_wrap(t.clone(), FontId::proportional(12.0), pal.dim));
+        let sync_w = sync_galley.as_ref().map_or(0.0, |g| g.size().x + 21.0);
+        // the sync status goes first when space is short
+        let (sync_galley, sync_w) = if room - x - sync_w < 120.0 { (None, 0.0) } else { (sync_galley, sync_w) };
+        let left = elided(p, &ctx_text, FontId::proportional(12.0), pal.dim, room - x - sync_w);
+        let left_w = left.size().x;
+        p.galley(Pos2::new(x, rect.center().y - left.size().y / 2.0), left, pal.dim);
+        if let (Some(g), Some((n, _))) = (sync_galley, sync) {
+            let dot = Pos2::new(x + left_w + 14.0, rect.center().y);
+            p.circle_filled(dot, 3.0, if n > 0 { pal.ok } else { pal.faint });
+            p.galley(Pos2::new(dot.x + 7.0, rect.center().y - g.size().y / 2.0), g, pal.dim);
+        }
         if open_actions {
             self.actions = if self.actions.is_some() { None } else { Some(0) };
         }
@@ -2225,6 +2485,9 @@ impl eframe::App for App {
         if self.editor.is_some() {
             self.group_editor(&ctx, &pal);
         }
+        if self.ignore.is_some() {
+            self.ignore_panel(&ctx, &pal);
+        }
 
         if let Some(a) = action {
             self.perform(&ctx, a);
@@ -2233,6 +2496,23 @@ impl eframe::App for App {
 }
 
 // ---------------------------------------------------------------- widgets --
+
+/// Width and the content height a dialog gets: `want` wide, but always inside
+/// the window (frame margins and a small gap left around it).
+fn dialog_room(ctx: &egui::Context, want: f32) -> (f32, f32) {
+    let screen = ctx.content_rect();
+    (want.min(screen.width() - 60.0).max(200.0), (screen.height() - 70.0).max(120.0))
+}
+
+/// One line of text, cut with "…" to fit `max_w`.
+fn elided(p: &egui::Painter, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<egui::Galley> {
+    let mut job = LayoutJob::single_section(text.to_string(), TextFormat { font_id: font, color, ..Default::default() });
+    job.wrap.max_width = max_w.max(12.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    p.layout_job(job)
+}
 
 fn dialog_frame(pal: &Palette) -> egui::Frame {
     egui::Frame::new()
@@ -2501,7 +2781,7 @@ mod tests {
     /// Without a system font that has them (macOS), ⏎ ⇧ ⌥ used to render as boxes.
     #[test]
     fn key_symbols_have_glyphs() {
-        let keys = "⌘⇧⌥⌃⏎⌫⎋↑↓";
+        let keys = "⌘⇧⌥⌃⏎⌫⎋↑↓↗▣"; // keycaps and item-kind tiles
         let check = |fonts: FontDefinitions| {
             let ctx = egui::Context::default();
             ctx.set_fonts(fonts);

@@ -119,6 +119,8 @@ pub enum Request {
     RedoOcr,
     /// Send the paste shortcut to the focused window (after the popup closed).
     Paste,
+    /// Replace `ignore_apps`: saved to config.toml and used right away.
+    SetIgnoredApps { apps: Vec<String> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

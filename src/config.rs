@@ -46,6 +46,9 @@ pub struct Config {
     pub paste_shortcut: String,
     /// "system", "dark" or "light".
     pub theme: String,
+    /// UI font file (.ttf / .otf / .ttc; "~/" allowed). Empty = the system UI
+    /// font (PingFang SC, Microsoft YaHei UI, or fontconfig's sans-serif).
+    pub font: String,
     /// Recognize text in images so they can be searched.
     pub ocr_enabled: bool,
     /// "auto" (native engine on Windows/macOS, built-in PP-OCR on Linux, else Tesseract),
@@ -100,6 +103,7 @@ impl Default for Config {
             paste_on_enter: true,
             paste_shortcut: String::new(),
             theme: "system".into(),
+            font: String::new(),
             ocr_enabled: true,
             ocr_engine: "auto".into(),
             ocr_languages: "chi_sim+chi_tra+eng".into(),
@@ -144,6 +148,23 @@ impl Config {
             }
         }
     }
+}
+
+/// Write `ignore_apps` into config.toml, keeping the rest of the file (comments
+/// and formatting) as it is.
+pub fn save_ignore_apps(apps: &[String]) -> Result<(), String> {
+    let path = config_path();
+    let text = with_ignore_apps(&std::fs::read_to_string(&path).unwrap_or_default(), apps)?;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(&path, text).map_err(|e| format!("保存 {} 失败：{e}", path.display()))
+}
+
+fn with_ignore_apps(text: &str, apps: &[String]) -> Result<String, String> {
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("config.toml 格式有误，未保存：{e}"))?;
+    doc["ignore_apps"] = toml_edit::value(apps.iter().map(String::as_str).collect::<toml_edit::Array>());
+    Ok(doc.to_string())
 }
 
 fn host_name() -> Option<String> {
@@ -223,4 +244,23 @@ pub fn log_path() -> PathBuf {
         .join("copym");
     let _ = std::fs::create_dir_all(&d);
     d.join("daemon.log")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignore_apps_keeps_the_rest_of_the_file() {
+        let before = "# my notes\ntheme = \"dark\" # inline\nignore_apps = [\"a\"]\n";
+        let after = with_ignore_apps(before, &["微信".into(), "chrome.exe".into()]).unwrap();
+        assert!(after.contains("# my notes") && after.contains("# inline"), "{after}");
+        let cfg: Config = toml::from_str(&after).unwrap();
+        assert_eq!(cfg.ignore_apps, ["微信", "chrome.exe"]);
+        assert_eq!(cfg.theme, "dark");
+        // a new file gets the key too
+        let cfg: Config = toml::from_str(&with_ignore_apps("", &[]).unwrap()).unwrap();
+        assert!(cfg.ignore_apps.is_empty());
+        assert!(with_ignore_apps("not = = toml", &[]).is_err());
+    }
 }

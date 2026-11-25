@@ -23,7 +23,7 @@ struct Shared {
     /// Image ids waiting for text recognition.
     ocr_tx: Option<mpsc::Sender<u64>>,
     ocr_name: Option<String>,
-    filters: Filters,
+    filters: std::sync::RwLock<Filters>,
     sync: OnceLock<copym_sync::Engine>,
     sync_images: bool,
     sync_max_image: usize,
@@ -125,6 +125,12 @@ impl Shared {
                     // focus the previous window again.
                     std::thread::sleep(std::time::Duration::from_millis(if cfg!(target_os = "macos") { 120 } else { 80 }));
                     crate::paste::send(&self.paste_shortcut).inspect_err(|e| eprintln!("copym: paste: {e}"))?;
+                    Response::Ok
+                }
+                Request::SetIgnoredApps { apps } => {
+                    let apps: Vec<String> = apps.iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect();
+                    crate::config::save_ignore_apps(&apps)?;
+                    self.filters.write().unwrap().set_apps(&apps);
                     Response::Ok
                 }
                 Request::ToggleGui { activation_token } => {
@@ -332,7 +338,7 @@ pub fn run() -> Result<(), String> {
         backend: monitor.backend,
         ocr_tx: ocr.as_ref().map(|_| ocr_tx.clone()),
         ocr_name: ocr.as_ref().map(Ocr::name),
-        filters: Filters::new(&cfg),
+        filters: std::sync::RwLock::new(Filters::new(&cfg)),
         sync: OnceLock::new(),
         sync_images: cfg.sync_images,
         sync_max_image: cfg.sync_max_image_bytes,
@@ -439,7 +445,7 @@ pub fn run() -> Result<(), String> {
                     if shared.paused.load(Ordering::Relaxed) {
                         continue;
                     }
-                    if let Some(why) = shared.filters.reject(&ev.content, ev.source.as_deref()) {
+                    if let Some(why) = shared.filters.read().unwrap().reject(&ev.content, ev.source.as_deref()) {
                         if cfg!(debug_assertions) {
                             eprintln!("copym: skipped ({why})");
                         }
@@ -635,7 +641,7 @@ impl copym_sync::Host for SyncHost {
             }
         };
         // Local rules still apply (ignore patterns, size limits, images off...).
-        if self.shared.filters.reject(&content, None).is_some() {
+        if self.shared.filters.read().unwrap().reject(&content, None).is_some() {
             return;
         }
         let is_image = matches!(content, Content::Image { .. });

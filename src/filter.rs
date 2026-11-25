@@ -24,13 +24,14 @@ impl Filters {
                 }
             })
             .collect();
-        Self {
-            apps: cfg.ignore_apps.iter().map(|a| a.to_lowercase()).filter(|a| !a.is_empty()).collect(),
-            patterns,
-            max_text: cfg.max_text_bytes,
-            max_image: cfg.max_image_bytes,
-            store_images: cfg.store_images,
-        }
+        let mut f = Self { apps: Vec::new(), patterns, max_text: cfg.max_text_bytes, max_image: cfg.max_image_bytes, store_images: cfg.store_images };
+        f.set_apps(&cfg.ignore_apps);
+        f
+    }
+
+    /// Apps whose copies are not recorded (case-insensitive substring of the source).
+    pub fn set_apps(&mut self, apps: &[String]) {
+        self.apps = apps.iter().map(|a| a.trim().to_lowercase()).filter(|a| !a.is_empty()).collect();
     }
 
     /// Returns `Some(reason)` when the content must not be recorded.

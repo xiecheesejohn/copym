@@ -16,17 +16,20 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            name: copym-linux-x86_64
+            platform: linux-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            name: copym-windows-x86_64
+            platform: windows-x86_64
           # Apple Silicon only for now (macos-latest runners are arm64).
           - os: macos-latest
             target: aarch64-apple-darwin
-            name: copym-macos-aarch64
+            platform: macos-aarch64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - name: Version for file names
+        shell: bash
+        run: ./.github/version.sh >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -38,18 +41,22 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev
       - run: cargo test --workspace
       - run: cargo build --release --target ${{ matrix.target }}
-      - name: Package (file name carries OS and architecture)
+      # File names carry version, OS and architecture (copym-0.1.0-linux-x86_64.tar.gz);
+      # the program inside keeps its plain name, so autostart entries survive upgrades.
+      - name: Package
         shell: bash
         run: |
-          mkdir dist
+          mkdir dist stage
           bin="target/${{ matrix.target }}/release/copym"
+          name="copym-$COPYM_VERSION-${{ matrix.platform }}"
           if [ "${{ runner.os }}" = macOS ]; then
-            version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-            packaging/macos/make-dmg.sh "$bin" "$version" "dist/${{ matrix.name }}.dmg"
+            packaging/macos/make-dmg.sh "$bin" "$CARGO_VERSION" "dist/$name.dmg"
           elif [ "${{ runner.os }}" = Windows ]; then
-            cp "$bin.exe" "dist/${{ matrix.name }}.exe"
+            cp "$bin.exe" stage/copym.exe
+            pwsh -NoProfile -Command "Compress-Archive -Path stage/copym.exe -DestinationPath dist/$name.zip"
           else
-            cp "$bin" "dist/${{ matrix.name }}"
+            cp "$bin" stage/copym
+            tar -C stage -czf "dist/$name.tar.gz" copym
           fi
           ls -l dist
       - name: Check the DMG
@@ -80,13 +87,15 @@ jobs:
         run: target/${{ matrix.target }}/release/copym.exe ocr tests/ocr-zh.png
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.name }}
+          name: copym-${{ env.COPYM_VERSION }}-${{ matrix.platform }}
           path: dist/*
 
   android:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Version for file names
+        run: ./.github/version.sh >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
@@ -107,12 +116,12 @@ jobs:
           mkdir dist
           for f in android/app/build/outputs/apk/release/app-*-release.apk; do
             abi=$(basename "$f" | sed -E 's/^app-(.*)-release\.apk$/\1/')
-            cp "$f" "dist/copym-android-$abi.apk"
+            cp "$f" "dist/copym-$COPYM_VERSION-android-$abi.apk"
           done
           ls -l dist
       - uses: actions/upload-artifact@v7
         with:
-          name: copym-android
+          name: copym-${{ env.COPYM_VERSION }}-android
           path: dist/*.apk
 
   # On a version tag: attach every build to a GitHub Release
@@ -136,17 +145,10 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
-      - name: Collect files
-        run: |
-          mkdir release
-          # artifacts lose the executable bit; ship the Linux binary in a tarball
-          chmod +x artifacts/copym-linux-x86_64
-          tar -C artifacts -czf release/copym-linux-x86_64.tar.gz copym-linux-x86_64
-          cp artifacts/*.exe artifacts/*.dmg artifacts/*.apk release/
-          ls -l release
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" release/* \
+          ls -l artifacts
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
             --title "copym ${GITHUB_REF_NAME#v}" --generate-notes --verify-tag

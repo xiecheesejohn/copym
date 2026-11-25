@@ -20,12 +20,12 @@
 
 ## 安装
 
-下载地址：[Releases](https://github.com/xiecheesejohn/copym/releases/latest)（正式版本）；每次提交的最新构建在 GitHub Actions 的构建产物里（需登录 GitHub）。
+下载地址：[Releases](https://github.com/xiecheesejohn/copym/releases/latest)（正式版本）；每次提交的最新构建在 GitHub Actions 的构建产物里（需登录 GitHub），版本号后面带提交号，例如 `copym-0.1.0-4011f23-linux-x86_64.tar.gz`。
 
-- **macOS（Apple 芯片）**：下载 `copym-macos-aarch64.dmg`，打开后把 copym 拖进“应用程序”。首次打开时系统会提示“无法验证开发者”（没有 Apple 开发者证书签名），到“系统设置 → 隐私与安全性”底部点“仍要打开”即可。之后按 `Option+C` 呼出，也可以在 Spotlight（`⌘空格`）里搜 copym 打开；在操作面板（`⌘K`）里选“登录时自动启动”。
-- **Windows**：下载 `copym-windows-x86_64.exe`，放到固定的目录（例如 `%LOCALAPPDATA%\Programs\copym\`）运行一次。之后在开始菜单 / Windows 搜索里搜 copym 就能打开（首次运行时自动创建开始菜单快捷方式），然后 `copym autostart on` 开机自启。
-- **Linux**：下载 `copym-linux-x86_64.tar.gz`，解压后放到 `~/.local/bin` 等目录运行一次，然后 `copym autostart on`。
-- **安卓**：按手机架构下载 `copym-android-*.apk`（一般选 `arm64-v8a`）。
+- **macOS（Apple 芯片）**：下载 `copym-<版本>-macos-aarch64.dmg`，打开后把 copym 拖进“应用程序”。首次打开时系统会提示“无法验证开发者”（没有 Apple 开发者证书签名），到“系统设置 → 隐私与安全性”底部点“仍要打开”即可。之后按 `Option+C` 呼出，也可以在 Spotlight（`⌘空格`）里搜 copym 打开；在操作面板（`⌘K`）里选“登录时自动启动”。
+- **Windows**：下载 `copym-<版本>-windows-x86_64.zip`，把里面的 `copym.exe` 解压到固定的目录（例如 `%LOCALAPPDATA%\Programs\copym\`，升级时覆盖同一个文件）运行一次。之后在开始菜单 / Windows 搜索里搜 copym 就能打开（首次运行时自动创建开始菜单快捷方式），然后 `copym autostart on` 开机自启。
+- **Linux**：下载 `copym-<版本>-linux-x86_64.tar.gz`，把里面的 `copym` 放到 `~/.local/bin` 等目录运行一次，然后 `copym autostart on`。
+- **安卓**：按手机架构下载 `copym-<版本>-android-*.apk`（一般选 `arm64-v8a`）。
 
 ## 构建
 
@@ -133,7 +133,7 @@ rest = true              # 不属于任何带 patterns / apps 的分组
 | `store_images` | true | 是否记录图片 |
 | `hotkey` | `Alt+C` | 全局快捷键（macOS 上 Alt = Option） |
 | `respect_password_hints` | true | 跳过带隐私标记的内容 |
-| `ignore_apps` | bitwarden, keepass, 1password … | 按来源应用忽略（Windows/macOS） |
+| `ignore_apps` | bitwarden, keepass, 1password … | 按来源应用忽略（Windows/macOS，名称包含匹配、不区分大小写）；也可以在弹窗操作面板（`⌘K` / `Alt+K`）的“不记录的应用…”里编辑，或对选中条目选“不再记录「某应用」的复制”，立即生效 |
 | `ignore_patterns` | [] | 正则，匹配的文本不记录 |
 | `restore_empty_clipboard` | true | Wayland：剪贴板被清空时恢复最新一条 |
 | `close_on_focus_lost` | true | 弹窗失焦自动关闭 |
@@ -142,6 +142,7 @@ rest = true              # 不属于任何带 patterns / apps 的分组
 | `paste_on_enter` | true | `Enter` 自动粘贴到之前的窗口；false 时只复制 |
 | `paste_shortcut` | （空 = `ctrl+v` / macOS `cmd+v`） | 粘贴时模拟的按键 |
 | `theme` | system | system / dark / light |
+| `font` | （空 = 系统界面字体） | 界面字体文件路径（.ttf / .otf / .ttc，可用 `~/`）；默认 macOS 苹方、Windows 微软雅黑 UI、Linux fontconfig 的中文 sans-serif |
 | `ocr_enabled` | true | 识别图片中的文字 |
 | `ocr_engine` | auto | auto / native / ppocr（Linux 内置）/ tesseract / off |
 | `ocr_languages` | chi_sim+chi_tra+eng | Tesseract 语言（未安装的自动跳过；内置引擎不需要） |
