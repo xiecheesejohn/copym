@@ -2389,7 +2389,8 @@ mod tests {
         let check = |fonts: FontDefinitions| {
             let ctx = egui::Context::default();
             ctx.set_fonts(fonts);
-            let _ = ctx.run_ui(Default::default(), |_| {});
+            // no renderer here: drop the font-atlas upload explicitly
+            ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
             ctx.fonts_mut(|f| f.has_glyphs(&FontId::proportional(13.0), keys))
         };
         assert!(!check(FontDefinitions::default()), "egui's own fonts lack them");
