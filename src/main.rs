@@ -15,6 +15,8 @@ mod ipc;
 mod kde_hotkey;
 mod ocr;
 mod paste;
+#[cfg(target_os = "linux")]
+mod ppocr;
 
 use model::{Filter, Kind, Request, Response};
 
@@ -140,7 +142,7 @@ fn ocr_cmd(args: &[String]) -> Result<(), String> {
             _ => Err("unexpected response".into()),
         },
         Some(path) => {
-            let o = ocr::Ocr::detect(&cfg).ok_or("没有可用的 OCR 引擎（Linux 需要安装 tesseract 和中文语言包）")?;
+            let o = ocr::Ocr::detect(&cfg).ok_or("没有可用的 OCR 引擎（ocr_enabled / ocr_engine 配置）")?;
             let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
             let t = std::time::Instant::now();
             let text = o.recognize(&bytes)?;

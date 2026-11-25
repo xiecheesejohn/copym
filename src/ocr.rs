@@ -3,6 +3,7 @@
 //! Engines (`ocr_engine = "auto"` picks the first available):
 //! * macOS   - Apple Vision (built in, zh-Hans/zh-Hant/en/...)
 //! * Windows - Windows.Media.Ocr (built in, uses the user's language packs)
+//! * Linux   - PP-OCRv6 tiny, built in (see `ppocr.rs`)
 //! * any OS  - Tesseract CLI (`tesseract` + language packs, e.g. chi_sim)
 //!
 //! OCR runs on a single low-priority background thread; it never blocks
@@ -13,8 +14,9 @@ use crate::imgutil;
 use std::path::PathBuf;
 
 /// Bump when the recognition pipeline improves: the daemon then re-runs OCR
-/// on every stored image once. 1 = raw images, 2 = preprocessing + tiling.
-pub const REVISION: u64 = 2;
+/// on every stored image once. 1 = raw images, 2 = preprocessing + tiling,
+/// 3 = built-in PP-OCR on Linux.
+pub const REVISION: u64 = 3;
 
 pub struct Ocr {
     engine: Engine,
@@ -22,6 +24,8 @@ pub struct Ocr {
 
 enum Engine {
     Tesseract { bin: String, langs: String, tessdata: Option<PathBuf> },
+    #[cfg(target_os = "linux")]
+    PpOcr(Box<crate::ppocr::PpOcr>),
     #[cfg(target_os = "macos")]
     Vision { langs: Vec<String> },
     #[cfg(windows)]
@@ -45,6 +49,13 @@ impl Ocr {
                 return Some(Self { engine: Engine::WinRt });
             }
         }
+        #[cfg(target_os = "linux")]
+        if want == "auto" || want == "native" || want == "ppocr" {
+            match crate::ppocr::PpOcr::new() {
+                Ok(p) => return Some(Self { engine: Engine::PpOcr(Box::new(p)) }),
+                Err(e) => eprintln!("copym: built-in OCR unavailable: {e}"),
+            }
+        }
         if want == "auto" || want == "tesseract" {
             if let Some(bin) = find_tesseract() {
                 let tessdata = Some(models_dir()).filter(|d| has_models(d));
@@ -60,6 +71,8 @@ impl Ocr {
             Engine::Tesseract { langs, tessdata, .. } => {
                 format!("tesseract ({langs}{})", if tessdata.is_some() { ", 高精度模型" } else { "" })
             }
+            #[cfg(target_os = "linux")]
+            Engine::PpOcr(_) => "pp-ocrv6 tiny (built in)".into(),
             #[cfg(target_os = "macos")]
             Engine::Vision { langs } => format!("apple vision ({})", langs.join(", ")),
             #[cfg(windows)]
@@ -80,12 +93,22 @@ impl Ocr {
                 let input = tesseract_input(w, h, &rgba).ok_or("cannot encode image")?;
                 tesseract(bin, langs, tessdata.as_deref(), &input)?
             }
+            #[cfg(target_os = "linux")]
+            Engine::PpOcr(p) => by_tiles(w, h, &rgba, |tw, th, tile| p.recognize(tw, th, tile))?,
             #[cfg(target_os = "macos")]
             Engine::Vision { langs } => by_tiles(w, h, &rgba, |tw, th, tile| vision::recognize(tile, tw, th, langs))?,
             #[cfg(windows)]
             Engine::WinRt => by_tiles(w, h, &rgba, |tw, th, tile| winrt::recognize(tile, tw, th))?,
         };
         Ok(normalize(&raw))
+    }
+
+    /// Release memory the engine can rebuild (called when OCR goes idle).
+    pub fn trim(&self) {
+        #[cfg(target_os = "linux")]
+        if let Engine::PpOcr(p) = &self.engine {
+            p.trim();
+        }
     }
 }
 
@@ -146,7 +169,6 @@ fn text_height(w: u32, h: u32, gray: &[u8]) -> Option<u32> {
 
 /// Long screenshots get downscaled inside the native engines until the text
 /// is unreadable; recognize them in overlapping, roughly page-shaped tiles.
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 fn by_tiles(w: u32, h: u32, rgba: &[u8], mut run: impl FnMut(u32, u32, &[u8]) -> Result<String, String>) -> Result<String, String> {
     let mut parts = Vec::new();
     for (y0, y1) in tile_rows(w, h) {
@@ -176,7 +198,17 @@ fn tile_rows(w: u32, h: u32) -> Vec<(u32, u32)> {
 
 /// Join tile results, dropping lines repeated in the overlap.
 fn merge_tiles(parts: &[String]) -> String {
-    let key = |l: &str| l.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    // the same line can come out slightly differently in two tiles (case, full-width punctuation)
+    let key = |l: &str| {
+        l.chars()
+            .filter(|c| !c.is_whitespace())
+            .map(|c| match c {
+                '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+                _ => c,
+            })
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
     let mut lines: Vec<String> = Vec::new();
     for part in parts {
         let recent: Vec<String> = lines.iter().rev().take(12).map(|l| key(l)).collect();
@@ -533,6 +565,8 @@ mod tests {
         assert!(t.windows(2).all(|p| p[1].0 < p[0].1)); // overlapping
         let parts = ["第一行\n第二行\n第 三 行".to_string(), "第三行\n第四行".to_string(), "第四行\n第五行".to_string()];
         assert_eq!(merge_tiles(&parts), "第一行\n第二行\n第 三 行\n第四行\n第五行");
+        let parts = ["a\n路径：Copym".to_string(), "路径:copym\nb".to_string()];
+        assert_eq!(merge_tiles(&parts), "a\n路径：Copym\nb");
         assert_eq!(vision_langs("chi_sim+chi_tra+eng"), ["zh-Hans", "zh-Hant", "en-US"]);
         assert_eq!(vision_langs("xyz"), ["zh-Hans", "zh-Hant", "en-US"]);
     }

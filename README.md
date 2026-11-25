@@ -134,8 +134,8 @@ rest = true              # 不属于任何带 patterns / apps 的分组
 | `paste_shortcut` | （空 = `ctrl+v` / macOS `cmd+v`） | 粘贴时模拟的按键 |
 | `theme` | system | system / dark / light |
 | `ocr_enabled` | true | 识别图片中的文字 |
-| `ocr_engine` | auto | auto / native / tesseract / off |
-| `ocr_languages` | chi_sim+chi_tra+eng | Tesseract 语言（未安装的自动跳过） |
+| `ocr_engine` | auto | auto / native / ppocr（Linux 内置）/ tesseract / off |
+| `ocr_languages` | chi_sim+chi_tra+eng | Tesseract 语言（未安装的自动跳过；内置引擎不需要） |
 
 ## 图片文字识别（OCR）
 
@@ -143,23 +143,28 @@ rest = true              # 不属于任何带 patterns / apps 的分组
 |---|---|---|
 | macOS | Apple Vision（系统自带） | 无 |
 | Windows | Windows.Media.Ocr（系统自带） | 对应语言的 OCR 语言包（中文系统一般已带） |
-| Linux | Tesseract | `sudo dnf install tesseract tesseract-langpack-chi_sim`（Debian/Ubuntu：`tesseract-ocr tesseract-ocr-chi-sim`） |
+| Linux | PP-OCRv6 tiny（内置，模型已打包进程序） | 无 |
+| 任意平台（`ocr_engine = "tesseract"`） | Tesseract | `sudo dnf install tesseract tesseract-langpack-chi_sim`（Debian/Ubuntu：`tesseract-ocr tesseract-ocr-chi-sim`） |
 
-识别在单独的后台线程中进行（Linux 上 nice 19、单核），不影响复制；装好引擎后重启守护进程，旧图片会自动补识别。
+识别在单独的后台线程中进行（Linux 上 nice 19、单核），不影响复制；更换引擎后重启守护进程，旧图片会自动补识别。
 
-**中文识别质量**：识别前会自动做预处理——透明背景铺白底、深色主题反相、按估计的文字行高把小字放大到引擎最擅长的尺寸（Tesseract），长截图切块识别并去掉重叠（Vision / Windows）。Vision 只用配置的语言（默认简中、繁中、英文，不再混入日文和韩文），并能识别长截图里的小字；Windows 装了中文 OCR 语言包时优先用中文引擎。
+**Linux 内置引擎**：[PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) 的 PP-OCRv6 tiny 模型（检测 + 识别共 6.3 MB，Apache-2.0，见 [models/ppocr](models/ppocr/README.md)），用纯 Rust 的 [tract](https://github.com/sonos/tract) 运行，不依赖系统库。简体、繁体、英文混排都能识别；模型在第一次识别时加载，空闲 60 秒后释放。代价是 Linux 版程序从约 11 MB 增加到约 36 MB。
 
-在 Linux 上用 Tesseract 实测（1 倍屏中文界面截图，字符错误率，越低越好）：
+**中文识别质量**：识别前会自动做预处理——透明背景铺白底、深色主题反相、按估计的文字行高把小字放大到引擎最擅长的尺寸（Tesseract），长截图切块识别并去掉重叠（内置引擎 / Vision / Windows）。Vision 只用配置的语言（默认简中、繁中、英文，不再混入日文和韩文），并能识别长截图里的小字；Windows 装了中文 OCR 语言包时优先用中文引擎。
 
-| 方案 | 13px 字 | 15px 字 | 深色模式 | 透明背景 | 2 倍屏 | 平均 |
-|---|---|---|---|---|---|---|
-| 旧版（原图 + 发行版自带模型） | 79% | 36% | 68% | 35% | 8% | 45% |
-| 新版（预处理 + 发行版自带模型） | 7% | 7% | 7% | 8% | 8% | 7.5% |
-| 新版 + 高精度模型（`copym ocr models`） | 6% | 4% | 5% | 4% | 5% | 4.8% |
+Linux 上实测（字符错误率，越低越好；单核、不含模型加载）。测试图：1 倍屏中文界面截图 9 张（13/15px、12px 灰字、深色模式、透明背景、2 倍屏、繁体、技术文本、宋体）+ copym 弹窗真实截图 1 张：
+
+| 引擎 | 1 倍屏界面 | 繁体 | 真实截图 | 平均 | 每张耗时 |
+|---|---|---|---|---|---|
+| **PP-OCRv6 tiny（内置）** | 0% | 11% | 4% | **1.5%** | 约 0.1 s |
+| Tesseract + 高精度模型（预处理后） | 6–17% | 6% | 35% | 13.6% | 约 0.7 s |
+| OCRia-nano-1（对比用，未采用） | 1–8% | 5% | 9% | 4.5% | 约 0.1 s |
+
+2880×1800 的高分屏截图和 1080×6000 的手机长截图也能完整识别（错误率 0.1% / 2.6%）。
 
 ```sh
 copym ocr 截图.png      # 直接识别一张图片，显示使用的引擎和耗时
-copym ocr models        # 下载 Tesseract 高精度模型（tessdata_best，约 30 MB），之后自动使用
+copym ocr models        # 下载 Tesseract 高精度模型（tessdata_best，约 30 MB），Tesseract 引擎自动使用
 copym ocr redo          # 用当前引擎重新识别所有已保存的图片
 ```
 
@@ -241,7 +246,8 @@ src/
   paste.rs         自动粘贴：模拟粘贴快捷键（SendInput / CGEvent / XTEST / uinput）
   groups.rs        分组定义（groups.toml）
   filter.rs        应用 / 正则 / 大小过滤
-  ocr.rs           图片文字识别（Vision / Windows.Media.Ocr / Tesseract）
+  ocr.rs           图片文字识别（Vision / Windows.Media.Ocr / 内置 PP-OCR / Tesseract）
+  ppocr.rs         Linux 内置 OCR：PP-OCRv6 tiny on tract（模型在 models/ppocr/）
   kde_hotkey.rs    KDE 全局快捷键（KGlobalAccel D-Bus）
 crates/copym-core/ 桌面与安卓共用：历史存储（redb + 内存索引）、数据模型、PNG 工具
 crates/copym-sync/ 局域网加密同步核心（平台无关）
@@ -257,4 +263,4 @@ assets/icon.svg    应用图标
 
 ## 许可证
 
-双许可证：[MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE)，任选其一。
+双许可证：[MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE)，任选其一。内置的 PP-OCRv6 模型来自 PaddleOCR，Apache-2.0（见 [models/ppocr](models/ppocr/README.md)）。

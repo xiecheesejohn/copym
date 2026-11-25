@@ -48,7 +48,8 @@ pub struct Config {
     pub theme: String,
     /// Recognize text in images so they can be searched.
     pub ocr_enabled: bool,
-    /// "auto" (native engine on Windows/macOS, Tesseract elsewhere), "native", "tesseract" or "off".
+    /// "auto" (native engine on Windows/macOS, built-in PP-OCR on Linux, else Tesseract),
+    /// "native", "ppocr" (Linux), "tesseract" or "off".
     pub ocr_engine: String,
     /// Tesseract languages, e.g. "chi_sim+chi_tra+eng" (missing packs are skipped).
     pub ocr_languages: String,

@@ -387,7 +387,15 @@ pub fn run() -> Result<(), String> {
             .name("ocr".into())
             .spawn(move || {
                 crate::ocr::lower_thread_priority();
-                for id in ocr_rx {
+                loop {
+                    let id = match ocr_rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                        Ok(id) => id,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            ocr.trim();
+                            continue;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
                     let job = {
                         let store = shared.store.lock().unwrap();
                         if !store.needs_ocr(id) {

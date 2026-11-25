@@ -59,6 +59,12 @@ jobs:
           /tmp/copym-dmg/copym.app/Contents/MacOS/copym version
           codesign --verify --deep --strict /tmp/copym-dmg/copym.app
           hdiutil detach /tmp/copym-dmg
+      - name: Chinese OCR (built-in PP-OCR)
+        if: runner.os == 'Linux'
+        run: |
+          out=$(target/${{ matrix.target }}/release/copym ocr tests/ocr-zh.png)
+          echo "$out"
+          echo "$out" | grep -q "验证码" && echo "$out" | grep -q "482913"
       - name: Chinese OCR (Apple Vision)
         if: runner.os == 'macOS'
         run: |
