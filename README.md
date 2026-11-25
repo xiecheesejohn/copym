@@ -137,7 +137,7 @@ rest = true              # 不属于任何带 patterns / apps 的分组
 | `ignore_patterns` | [] | 正则，匹配的文本不记录 |
 | `restore_empty_clipboard` | true | Wayland：剪贴板被清空时恢复最新一条 |
 | `close_on_focus_lost` | true | 弹窗失焦自动关闭 |
-| `keep_popup_loaded` | true | 弹窗进程常驻后台，打开更快（约多占 35 MB 内存）；macOS 上暂不支持，始终按需启动 |
+| `keep_popup_loaded` | true | 弹窗进程常驻后台，打开更快（约多占 35 MB 内存） |
 | `popup_focus` | list | 打开弹窗时键盘在 `list`（列表）还是 `search`（搜索框） |
 | `paste_on_enter` | true | `Enter` 自动粘贴到之前的窗口；false 时只复制 |
 | `paste_shortcut` | （空 = `ctrl+v` / macOS `cmd+v`） | 粘贴时模拟的按键 |

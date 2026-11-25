@@ -49,7 +49,7 @@ struct AfterClose {
 pub fn run(open: &str) -> Result<(), String> {
     trace("gui::run");
     let prev = std::env::var("COPYM_PREV_WINDOW").ok();
-    let after = open_window(None, Config::load(), open, None, Arc::new(AtomicBool::new(false)))?;
+    let after = open_window(None, Config::load(), open, None, Arc::new(AtomicBool::new(false)), None)?;
     if let Some(e) = finish(&after, prev.as_deref()) {
         eprintln!("copym: {e}");
     }
@@ -65,9 +65,12 @@ pub fn host() -> Result<(), String> {
     setup_ctx(&ctx, &Config::load());
     let open = Arc::new(AtomicBool::new(false));
     let close = Arc::new(AtomicBool::new(false));
+    // macOS: after the first show the window stays alive and is hidden / shown
+    // again (see `Resident`), so this thread shows it directly.
+    let resident = Resident { open: open.clone(), show: Arc::default(), running: Arc::default(), notice: Arc::default() };
     let (tx, rx) = mpsc::channel::<Option<(Option<String>, Option<String>)>>();
     {
-        let (ctx, open, close) = (ctx.clone(), open.clone(), close.clone());
+        let (ctx, open, close, resident) = (ctx.clone(), open.clone(), close.clone(), resident.clone());
         std::thread::spawn(move || {
             use std::io::BufRead;
             for line in std::io::stdin().lock().lines() {
@@ -80,11 +83,18 @@ pub fn host() -> Result<(), String> {
                     // Already open (or opening): the hotkey closes it.
                     close.store(true, Ordering::SeqCst);
                     ctx.request_repaint();
+                } else if resident.running.load(Ordering::SeqCst) {
+                    resident.show.store(true, Ordering::SeqCst);
+                    resident::unhide();
+                    ctx.request_repaint();
                 } else if tx.send(Some((token, prev))).is_err() {
                     break;
                 }
             }
             // stdin closed: the daemon is gone.
+            if resident.running.load(Ordering::SeqCst) {
+                std::process::exit(0);
+            }
             close.store(true, Ordering::SeqCst);
             ctx.request_repaint();
             let _ = tx.send(None);
@@ -115,7 +125,15 @@ pub fn host() -> Result<(), String> {
         egui::Popup::close_all(&ctx);
         ctx.memory_mut(|m| m.data.clear());
         close.store(false, Ordering::SeqCst);
-        let after = open_window(Some(ctx.clone()), Config::load(), "", notice.take(), close.clone());
+        let keep = cfg!(target_os = "macos").then(|| resident.clone());
+        if keep.is_some() {
+            resident.running.store(true, Ordering::SeqCst);
+        }
+        let after = open_window(Some(ctx.clone()), Config::load(), "", notice.take(), close.clone(), keep.clone());
+        if keep.is_some() {
+            // only returns when the user quit copym
+            return after.map(|_| ());
+        }
         shown = true;
         open.store(false, Ordering::SeqCst);
         match after {
@@ -129,7 +147,45 @@ pub fn host() -> Result<(), String> {
     Ok(())
 }
 
-fn open_window(ctx: Option<egui::Context>, cfg: Config, open: &str, notice: Option<String>, close: Arc<AtomicBool>) -> Result<AfterClose, String> {
+/// macOS popup host: the event loop must keep running on the main thread, or
+/// macOS marks the process "not responding" and `NSApplication.hide` (focus
+/// back to the previous app) never completes. So, as CopyQ does, the window is
+/// created once and closing only hides the app; the stdin thread shows it again.
+#[derive(Clone)]
+struct Resident {
+    /// Shared with the stdin thread: the popup is visible (or being shown).
+    open: Arc<AtomicBool>,
+    /// Set by the stdin thread: show again, starting fresh.
+    show: Arc<AtomicBool>,
+    /// The window exists (after the first show).
+    running: Arc<AtomicBool>,
+    /// Paste error from the last close, shown next time.
+    notice: Arc<Mutex<Option<String>>>,
+}
+
+mod resident {
+    /// Show the hidden app again (from any thread).
+    pub fn unhide() {
+        #[cfg(target_os = "macos")]
+        dispatch2::DispatchQueue::main().exec_async(|| {
+            if let Some(mtm) = objc2::MainThreadMarker::new() {
+                let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+                app.unhide(None);
+                #[allow(deprecated)] // `activate` needs macOS 14
+                app.activateIgnoringOtherApps(true);
+            }
+        });
+    }
+}
+
+fn open_window(
+    ctx: Option<egui::Context>,
+    cfg: Config,
+    open: &str,
+    notice: Option<String>,
+    close: Arc<AtomicBool>,
+    resident: Option<Resident>,
+) -> Result<AfterClose, String> {
     let open = open.to_string();
     let fresh = ctx.is_none();
     let after = Arc::new(Mutex::new(AfterClose::default()));
@@ -159,6 +215,7 @@ fn open_window(ctx: Option<egui::Context>, cfg: Config, open: &str, notice: Opti
                 trace("fonts");
             }
             let mut app = App::new(cfg, after, close);
+            app.resident = resident;
             trace("app state");
             if let Some(n) = notice {
                 app.notify(n);
@@ -210,6 +267,11 @@ fn setup_ctx(ctx: &egui::Context, cfg: &Config) {
 /// Returns the paste error, if any.
 fn finish(after: &AfterClose, prev: Option<&str>) -> Option<String> {
     restore_focus(prev);
+    paste_after(after)
+}
+
+/// Ask the daemon to paste (it waits for the focus change first).
+fn paste_after(after: &AfterClose) -> Option<String> {
     if !after.paste {
         return None;
     }
@@ -456,6 +518,10 @@ struct App {
     /// Set by the popup host when the hotkey asks the window to close.
     close_req: Arc<AtomicBool>,
     after: Arc<Mutex<AfterClose>>,
+    /// macOS: the window is kept and hidden instead of closed.
+    resident: Option<Resident>,
+    /// Hidden (resident mode): skip frames until shown again.
+    hidden: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -588,6 +654,8 @@ impl App {
             search_mode: false,
             close_req,
             after,
+            resident: None,
+            hidden: false,
         };
         app.search_mode = app.cfg.popup_focus == "search";
         app.connect();
@@ -756,7 +824,7 @@ impl App {
                 if let Some(id) = self.items.get(i).map(|m| m.id) {
                     if self.req(&Request::Activate { id }).is_some() {
                         self.after.lock().unwrap().paste = paste;
-                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                        self.close(ctx);
                     }
                 }
             }
@@ -934,7 +1002,7 @@ impl App {
                     self.dirty = true;
                 }
                 if self.cfg.popup_focus == "search" && self.query.is_empty() && !self.dirty {
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                    self.close(ctx);
                 } else {
                     self.search_mode = false;
                     ctx.memory_mut(|m| m.surrender_focus(egui::Id::unique("search")));
@@ -943,10 +1011,47 @@ impl App {
                 self.query.clear();
                 self.dirty = true;
             } else {
-                ctx.send_viewport_cmd(ViewportCommand::Close);
+                self.close(ctx);
             }
         }
         action
+    }
+
+    /// Close the popup: end the window, or (resident mode) hide the app, which
+    /// gives the focus back to the previous app, and paste in the background.
+    fn close(&mut self, ctx: &egui::Context) {
+        let Some(r) = &self.resident else {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+            return;
+        };
+        if self.hidden {
+            return;
+        }
+        self.hidden = true;
+        let after = std::mem::take(&mut *self.after.lock().unwrap());
+        restore_focus(None);
+        r.open.store(false, Ordering::SeqCst);
+        let notice = r.notice.clone();
+        std::thread::spawn(move || {
+            if let Some(e) = paste_after(&after) {
+                *notice.lock().unwrap() = Some(format!("自动粘贴失败：{e}（内容已在剪贴板）"));
+            }
+        });
+    }
+
+    /// Resident mode: shown again - start from a fresh state, like a new window.
+    fn reset_for_show(&mut self, ctx: &egui::Context) {
+        let notice = self.resident.as_ref().and_then(|r| r.notice.lock().unwrap().take());
+        let mut app = App::new(Config::load(), self.after.clone(), self.close_req.clone());
+        app.resident = self.resident.take();
+        *self = app;
+        self.close_req.store(false, Ordering::SeqCst);
+        if let Some(n) = notice {
+            self.notify(n);
+        }
+        egui::Popup::close_all(ctx);
+        ctx.memory_mut(|m| m.data.clear());
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
     }
 
     /// Stop copym (daemon and popup).
@@ -1990,15 +2095,21 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        if self.resident.as_ref().is_some_and(|r| r.show.swap(false, Ordering::SeqCst)) {
+            self.reset_for_show(&ctx);
+        }
+        if self.hidden {
+            return;
+        }
         if self.close_req.swap(false, Ordering::SeqCst) {
-            ctx.send_viewport_cmd(ViewportCommand::Close);
+            self.close(&ctx);
         }
         // Close when focus moves elsewhere (like a native popup).
         if let Some(focused) = ctx.input(|i| i.viewport().focused) {
             if focused {
                 self.had_focus = true;
             } else if self.had_focus && self.cfg.close_on_focus_lost {
-                ctx.send_viewport_cmd(ViewportCommand::Close);
+                self.close(&ctx);
             }
         }
 

@@ -34,7 +34,6 @@ pub struct Config {
     pub close_on_focus_lost: bool,
     /// Keep the popup process loaded in the background so the hotkey opens it
     /// instantly (costs some memory while hidden). false = start it on demand.
-    /// Ignored on macOS (always on demand), see daemon.rs.
     pub keep_popup_loaded: bool,
     /// Where the keyboard goes when the popup opens: "list" (navigate right
     /// away; press / or start typing in the search box with a click) or "search".
