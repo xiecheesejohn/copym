@@ -326,7 +326,11 @@ pub fn run() -> Result<(), String> {
         writer: Mutex::new(monitor.writer),
         paused: AtomicBool::new(false),
         gui: Mutex::new(None),
-        keep_popup_loaded: cfg.keep_popup_loaded && !config::is_secondary_instance(),
+        // Not on macOS: between shows the host's main thread waits for the next
+        // toggle instead of running the AppKit event loop, so macOS marks it "not
+        // responding" and NSApplication.hide (focus back to the previous app)
+        // never completes - the previous app then seems frozen.
+        keep_popup_loaded: cfg.keep_popup_loaded && !config::is_secondary_instance() && !cfg!(target_os = "macos"),
         paste_shortcut: cfg.paste_shortcut.clone(),
         backend: monitor.backend,
         ocr_tx: ocr.as_ref().map(|_| ocr_tx.clone()),
