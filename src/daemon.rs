@@ -216,6 +216,7 @@ impl Shared {
 
     /// Open the popup, or close it if it is already open.
     fn toggle_gui(&self, token: Option<String>) -> Result<(), String> {
+        crate::gui::trace("hotkey");
         #[cfg(windows)]
         unsafe {
             // We just received the hotkey, so we may hand foreground rights to the popup.

@@ -75,6 +75,7 @@ pub fn host() -> Result<(), String> {
             use std::io::BufRead;
             for line in std::io::stdin().lock().lines() {
                 let Ok(line) = line else { break };
+                trace("toggle received");
                 let mut parts = line.split('\t').map(|p| (p != "-" && !p.is_empty()).then(|| p.to_string()));
                 let _cmd = parts.next();
                 let token = parts.next().flatten();
@@ -2371,10 +2372,14 @@ fn url_preview(ui: &mut egui::Ui, pal: &Palette, url: &str) {
 
 // ---------------------------------------------------------------- helpers --
 
-/// `COPYM_TRACE=1`: print startup timings (ms since process start) to stderr.
-fn trace(what: &str) {
+/// `COPYM_TRACE=1`: print timings to stderr - wall clock (seconds within the
+/// minute, comparable between the daemon and the popup process) and ms since
+/// this process started. Hotkey to first frame = "frame 1" minus "hotkey".
+pub(crate) fn trace(what: &str) {
     if std::env::var_os("COPYM_TRACE").is_some() {
-        eprintln!("[{:>6.1} ms] {what}", crate::START.get().map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0));
+        let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let since_start = crate::START.get().map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+        eprintln!("[{:06.3} s | {since_start:>9.1} ms] {} {what}", (wall.as_millis() % 60_000) as f64 / 1000.0, std::process::id());
     }
 }
 
