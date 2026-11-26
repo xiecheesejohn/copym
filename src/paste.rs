@@ -78,9 +78,10 @@ mod imp {
             Ok(()) => return Ok(()),
             Err(e) => errors.push(e),
         }
-        Err(format!(
+        Err(tf!(
             "无法模拟按键（{}）。可以给当前用户 /dev/uinput 的写权限，或安装 wtype / ydotool",
-            errors.join("；")
+            "cannot simulate keys ({}). Give your user write access to /dev/uinput, or install wtype / ydotool",
+            errors.join("; ")
         ))
     }
 
@@ -235,7 +236,7 @@ mod imp {
         if let Ok(true) = run(Command::new("ydotool").arg("key").args(&keys)) {
             return Ok(());
         }
-        Err("没有可用的 wtype / ydotool".into())
+        Err(t!("没有可用的 wtype / ydotool", "neither wtype nor ydotool is available").into())
     }
 
     // --- X11 ---------------------------------------------------------------
@@ -340,7 +341,7 @@ mod imp {
         v.push(input(key, true, ext));
         v.extend(mods.iter().rev().map(|m| input(*m, true, false)));
         let n = unsafe { SendInput(v.len() as u32, v.as_ptr(), std::mem::size_of::<INPUT>() as i32) };
-        if n as usize == v.len() { Ok(()) } else { Err("SendInput 被系统拒绝（目标窗口权限更高？）".into()) }
+        if n as usize == v.len() { Ok(()) } else { Err(t!("SendInput 被系统拒绝（目标窗口权限更高？）", "SendInput was refused (does the target window run with higher privileges?)").into()) }
     }
 }
 
@@ -387,7 +388,7 @@ mod imp {
             let _ = std::process::Command::new("open")
                 .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
                 .spawn();
-            return Err("需要在「系统设置 › 隐私与安全性 › 辅助功能」中允许 copym 才能自动粘贴".into());
+            return Err(t!("需要在「系统设置 › 隐私与安全性 › 辅助功能」中允许 copym 才能自动粘贴", "allow copym in System Settings › Privacy & Security › Accessibility to paste automatically").into());
         }
         let mut flags = 0u64;
         for m in &sc.mods {

@@ -18,7 +18,7 @@ struct Shared {
     /// The popup: a one-shot process, or the long-lived popup host.
     gui: Mutex<Option<Child>>,
     keep_popup_loaded: bool,
-    paste_shortcut: String,
+    paste_shortcut: Mutex<String>,
     backend: &'static str,
     /// Image ids waiting for text recognition.
     ocr_tx: Option<mpsc::Sender<u64>>,
@@ -27,6 +27,8 @@ struct Shared {
     sync: OnceLock<copym_sync::Engine>,
     sync_images: bool,
     sync_max_image: usize,
+    /// Newer release found by the update check.
+    update: Mutex<Option<copym_core::model::UpdateInfo>>,
 }
 
 impl Shared {
@@ -37,18 +39,20 @@ impl Shared {
                     let q = Query::parse(&query, regex)?;
                     Response::Items(self.store.lock().unwrap().list(&q, filter, limit as usize))
                 }
-                Request::ListGroup { query, regex, group, limit } => {
+                Request::ListGroup { query, regex, group, before, limit } => {
                     let q = Query::parse(&query, regex)?;
                     let g = group.as_ref().map(GroupMatcher::new).transpose()?;
-                    Response::Items(self.store.lock().unwrap().list_group(&q, g.as_ref(), limit as usize))
+                    let page = self.store.lock().unwrap().list_group(&q, g.as_ref(), before, limit as usize);
+                    Response::Page { items: page.items, next: page.next }
                 }
                 Request::GroupCounts { query, regex, groups } => {
                     let q = Query::parse(&query, regex)?;
                     let gs: Vec<_> = groups.iter().map(|g| GroupMatcher::new(g).ok()).collect();
-                    Response::Counts(self.store.lock().unwrap().group_counts(&q, &gs))
+                    let c = self.store.lock().unwrap().group_counts(&q, &gs);
+                    Response::GroupCounts { counts: c.counts, more: c.more }
                 }
                 Request::RedoOcr => {
-                    let Some(tx) = &self.ocr_tx else { return Err("图片文字识别未启用".into()) };
+                    let Some(tx) = &self.ocr_tx else { return Err(t!("图片文字识别未启用", "text recognition is off").into()) };
                     let mut store = self.store.lock().unwrap();
                     let n = store.reset_ocr()?;
                     for id in store.pending_ocr() {
@@ -82,6 +86,14 @@ impl Shared {
                     self.store.lock().unwrap().toggle_pin(id)?;
                     Response::Ok
                 }
+                Request::SetPin { id, board } => {
+                    self.store.lock().unwrap().set_pin(id, board)?;
+                    Response::Ok
+                }
+                Request::PinLatest { board } => match self.store.lock().unwrap().pin_latest(board)? {
+                    Some(_) => Response::Ok,
+                    None => return Err(t!("剪贴板历史为空", "the clipboard history is empty").into()),
+                },
                 Request::Clear => {
                     let tombs = self.store.lock().unwrap().clear()?;
                     if let Some(s) = self.sync.get() {
@@ -91,7 +103,7 @@ impl Shared {
                 }
                 Request::SyncStatus => Response::Sync(self.sync_info()),
                 Request::SyncPair => {
-                    let s = self.sync.get().ok_or("同步未启用（config.toml 中 sync_enabled = false）")?;
+                    let s = self.sync.get().ok_or(t!("同步未启用（config.toml 中 sync_enabled = false）", "sync is off (sync_enabled = false in config.toml)"))?;
                     let p = s.pair_start().map_err(|e| e.to_string())?;
                     Response::Pairing {
                         code: p.code,
@@ -100,9 +112,9 @@ impl Shared {
                     }
                 }
                 Request::SyncJoin { code, addr } => {
-                    let s = self.sync.get().ok_or("同步未启用（config.toml 中 sync_enabled = false）")?;
+                    let s = self.sync.get().ok_or(t!("同步未启用（config.toml 中 sync_enabled = false）", "sync is off (sync_enabled = false in config.toml)"))?;
                     let addr = match addr {
-                        Some(a) => Some(a.parse().map_err(|_| format!("地址无效：{a}（格式 IP:端口）"))?),
+                        Some(a) => Some(a.parse().map_err(|_| tf!("地址无效：{a}（格式 IP:端口）", "invalid address: {a} (IP:port)"))?),
                         None => None,
                     };
                     let name = s.join(&code, addr).map_err(|e| e.to_string())?;
@@ -124,7 +136,14 @@ impl Shared {
                     // The popup has just closed: give the compositor a moment to
                     // focus the previous window again.
                     std::thread::sleep(std::time::Duration::from_millis(if cfg!(target_os = "macos") { 120 } else { 80 }));
-                    crate::paste::send(&self.paste_shortcut).inspect_err(|e| eprintln!("copym: paste: {e}"))?;
+                    crate::paste::send(&self.paste_shortcut.lock().unwrap().clone()).inspect_err(|e| eprintln!("copym: paste: {e}"))?;
+                    Response::Ok
+                }
+                Request::ReloadConfig => {
+                    let cfg = Config::load();
+                    *self.filters.write().unwrap() = Filters::new(&cfg);
+                    *self.paste_shortcut.lock().unwrap() = cfg.paste_shortcut.clone();
+                    crate::init_language(&cfg.language);
                     Response::Ok
                 }
                 Request::SetIgnoredApps { apps } => {
@@ -132,6 +151,12 @@ impl Shared {
                     crate::config::save_ignore_apps(&apps)?;
                     self.filters.write().unwrap().set_apps(&apps);
                     Response::Ok
+                }
+                Request::CheckUpdate { now } => {
+                    if now {
+                        *self.update.lock().unwrap() = crate::update::check()?;
+                    }
+                    Response::Update(self.update.lock().unwrap().clone())
                 }
                 Request::ToggleGui { activation_token } => {
                     self.toggle_gui(activation_token)?;
@@ -299,7 +324,7 @@ pub fn run() -> Result<(), String> {
         return Ok(());
     }
     let cfg = Config::load();
-    let store = Store::open(&config::data_dir().join("history.redb"), cfg.max_items)?;
+    let store = Store::open(&config::data_dir().join("history.sqlite"), cfg.max_items)?;
 
     // Windows search finds apps through Start menu shortcuts.
     #[cfg(windows)]
@@ -334,7 +359,7 @@ pub fn run() -> Result<(), String> {
         paused: AtomicBool::new(false),
         gui: Mutex::new(None),
         keep_popup_loaded: cfg.keep_popup_loaded && !config::is_secondary_instance(),
-        paste_shortcut: cfg.paste_shortcut.clone(),
+        paste_shortcut: Mutex::new(cfg.paste_shortcut.clone()),
         backend: monitor.backend,
         ocr_tx: ocr.as_ref().map(|_| ocr_tx.clone()),
         ocr_name: ocr.as_ref().map(Ocr::name),
@@ -342,7 +367,41 @@ pub fn run() -> Result<(), String> {
         sync: OnceLock::new(),
         sync_images: cfg.sync_images,
         sync_max_image: cfg.sync_max_image_bytes,
+        update: Mutex::new(None),
     });
+
+    // Store upkeep (group views): short steps so requests never wait long for the lock.
+    {
+        let shared = shared.clone();
+        std::thread::Builder::new()
+            .name("store".into())
+            .spawn(move || loop {
+                let more = shared.store.lock().unwrap().background_work(std::time::Duration::from_millis(15));
+                std::thread::sleep(std::time::Duration::from_millis(if more { 5 } else { 1000 }));
+            })
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Update check: a minute after start, then daily.
+    if cfg.check_updates && !config::is_secondary_instance() {
+        let shared = shared.clone();
+        std::thread::Builder::new()
+            .name("update".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                match crate::update::check() {
+                    Ok(u) => {
+                        if let Some(u) = &u {
+                            eprintln!("copym: update available: {}", u.version);
+                        }
+                        *shared.update.lock().unwrap() = u;
+                    }
+                    Err(e) => eprintln!("copym: {e}"),
+                }
+                std::thread::sleep(std::time::Duration::from_secs(24 * 3600 - 60));
+            })
+            .map_err(|e| e.to_string())?;
+    }
 
     // LAN sync.
     if cfg.sync_enabled {
@@ -494,37 +553,74 @@ pub fn run() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
 
-    // Global hotkey (must be created on the main thread on Windows/macOS).
+    // Global hotkeys (must be created on the main thread on Windows/macOS):
+    // the popup, plus one per pin group that has a shortcut.
     let primary = !config::is_secondary_instance();
-    let _hotkey = if monitor.supports_hotkey && primary { register_hotkey(&cfg.hotkey, shared.clone()) } else { None };
-    #[cfg(target_os = "linux")]
-    if !monitor.supports_hotkey && primary {
-        // Wayland: use KDE's global shortcut service when available.
+    let mut keys: Vec<Hotkey> = Vec::new();
+    {
         let s = shared.clone();
-        match crate::kde_hotkey::register(&cfg.hotkey, move || {
-            if let Err(e) = s.toggle_gui(None) {
-                eprintln!("copym: cannot open popup: {e}");
-            }
-        }) {
-            Ok(()) => eprintln!("copym: hotkey {} registered (KDE global shortcuts)", cfg.hotkey),
-            Err(e) => eprintln!(
-                "copym: no global hotkey ({e}); bind `copym show` to a shortcut in your desktop settings"
-            ),
-        }
+        keys.push(Hotkey {
+            action: "toggle".into(),
+            label: t!("打开 copym 剪贴板", "Open copym clipboard").into(),
+            spec: cfg.hotkey.clone(),
+            run: Box::new(move || {
+                if let Err(e) = s.toggle_gui(None) {
+                    eprintln!("copym: cannot open popup: {e}");
+                }
+            }),
+        });
     }
+    let (groups, _) = crate::groups::load();
+    for (_, g) in groups.boards().filter(|(_, g)| !g.hotkey.trim().is_empty()) {
+        let (s, board) = (shared.clone(), g.board);
+        keys.push(Hotkey {
+            action: format!("pin-{board}"),
+            label: tf!("把剪贴板放进「{}」", "Put the clipboard into “{}”", g.name),
+            spec: g.hotkey.trim().to_string(),
+            run: Box::new(move || {
+                if let Err(e) = s.store.lock().unwrap().pin_latest(board) {
+                    eprintln!("copym: pin: {e}");
+                }
+            }),
+        });
+    }
+    let _hotkeys = if monitor.supports_hotkey && primary {
+        register_hotkeys(keys)
+    } else {
+        // Wayland: use KDE's global shortcut service when available.
+        #[cfg(target_os = "linux")]
+        if primary {
+            for k in keys {
+                match crate::kde_hotkey::register(&k.action, &k.label, &k.spec, k.run) {
+                    Ok(()) => eprintln!("copym: hotkey {} registered (KDE global shortcuts)", k.spec),
+                    Err(e) if k.action == "toggle" => {
+                        eprintln!("copym: no global hotkey ({e}); bind `copym show` to a shortcut in your desktop settings")
+                    }
+                    Err(e) => eprintln!("copym: hotkey {}: {e}; bind `copym pin-current` to a shortcut in your desktop settings", k.spec),
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        drop(keys);
+        None
+    };
 
     (monitor.run)()
 }
 
-fn register_hotkey(spec: &str, shared: Arc<Shared>) -> Option<global_hotkey::GlobalHotKeyManager> {
+/// A global shortcut and what it does.
+struct Hotkey {
+    /// Stable name (KDE stores shortcuts per action).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    action: String,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    label: String,
+    spec: String,
+    run: Box<dyn Fn() + Send + Sync>,
+}
+
+fn register_hotkeys(keys: Vec<Hotkey>) -> Option<global_hotkey::GlobalHotKeyManager> {
     use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
-    let hotkey: HotKey = match spec.parse() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("copym: invalid hotkey {spec:?}: {e}");
-            return None;
-        }
-    };
     let manager = match GlobalHotKeyManager::new() {
         Ok(m) => m,
         Err(e) => {
@@ -532,19 +628,29 @@ fn register_hotkey(spec: &str, shared: Arc<Shared>) -> Option<global_hotkey::Glo
             return None;
         }
     };
-    if let Err(e) = manager.register(hotkey) {
-        eprintln!("copym: cannot register hotkey {spec}: {e}");
-        return None;
+    let mut actions: std::collections::HashMap<u32, Box<dyn Fn() + Send + Sync>> = std::collections::HashMap::new();
+    for k in keys {
+        let hotkey: HotKey = match k.spec.parse() {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("copym: invalid hotkey {:?}: {e}", k.spec);
+                continue;
+            }
+        };
+        if let Err(e) = manager.register(hotkey) {
+            eprintln!("copym: cannot register hotkey {}: {e}", k.spec);
+            continue;
+        }
+        eprintln!("copym: hotkey {} registered", k.spec);
+        actions.insert(hotkey.id(), k.run);
     }
-    let id = hotkey.id();
     GlobalHotKeyEvent::set_event_handler(Some(move |ev: GlobalHotKeyEvent| {
-        if ev.id == id && ev.state == HotKeyState::Pressed {
-            if let Err(e) = shared.toggle_gui(None) {
-                eprintln!("copym: cannot open popup: {e}");
+        if ev.state == HotKeyState::Pressed {
+            if let Some(run) = actions.get(&ev.id) {
+                run();
             }
         }
     }));
-    eprintln!("copym: hotkey {spec} registered");
     Some(manager)
 }
 

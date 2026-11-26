@@ -7,15 +7,14 @@ use zbus::zvariant::OwnedObjectPath;
 
 const SERVICE: &str = "org.kde.kglobalaccel";
 const COMPONENT: &str = "copym";
-const ACTION: &str = "toggle";
 
-/// Register `spec` (e.g. "Alt+C") and call `on_press` whenever it is pressed.
-pub fn register(spec: &str, on_press: impl Fn() + Send + 'static) -> Result<(), String> {
+/// Register `spec` (e.g. "Alt+C") as `action` and call `on_press` whenever it is pressed.
+pub fn register(action: &str, label: &str, spec: &str, on_press: impl Fn() + Send + 'static) -> Result<(), String> {
     let key = qt_key(spec).ok_or_else(|| format!("cannot parse hotkey {spec:?}"))?;
     let e = |err: zbus::Error| err.to_string();
     let conn = Connection::session().map_err(e)?;
     let accel = Proxy::new(&conn, SERVICE, "/kglobalaccel", "org.kde.KGlobalAccel").map_err(e)?;
-    let id = vec![COMPONENT, ACTION, "copym", "打开 copym 剪贴板"];
+    let id = vec![COMPONENT, action, "copym", label];
     accel.call::<_, _, ()>("doRegister", &(id.clone(),)).map_err(e)?;
     // flags: SetPresent (2) | NoAutoloading (4) -> config.toml is the source of truth.
     let active: Vec<i32> = accel.call("setShortcut", &(id, vec![key], 6u32)).map_err(e)?;
@@ -25,13 +24,14 @@ pub fn register(spec: &str, on_press: impl Fn() + Send + 'static) -> Result<(), 
     let path: OwnedObjectPath = accel.call("getComponent", &(COMPONENT,)).map_err(e)?;
     let component = Proxy::new(&conn, SERVICE, path, "org.kde.kglobalaccel.Component").map_err(e)?;
     let signals = component.receive_signal("globalShortcutPressed").map_err(e)?;
+    let action = action.to_string();
     std::thread::Builder::new()
         .name("kde-hotkey".into())
         .spawn(move || {
             let _keep = (conn, component);
             for msg in signals {
-                if let Ok((comp, action, _ts)) = msg.body().deserialize::<(String, String, i64)>() {
-                    if comp == COMPONENT && action == ACTION {
+                if let Ok((comp, a, _ts)) = msg.body().deserialize::<(String, String, i64)>() {
+                    if comp == COMPONENT && action == a {
                         on_press();
                     }
                 }

@@ -24,10 +24,25 @@ pub struct GroupDef {
     /// "Everything else": items not caught by any group that has patterns/apps.
     #[serde(skip_serializing_if = "is_false")]
     pub rest: bool,
+    /// Pin group number (> 0): items are put here by hand (`m` + key in the
+    /// popup, or the global `hotkey`) instead of matching rules.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub board: u32,
+    /// One character: `'` + key jumps to the group; for pin groups `m` + key
+    /// pins the selected item into it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub key: String,
+    /// Global shortcut (pin groups): puts the current clipboard into the group.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub hotkey: String,
 }
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -47,13 +62,17 @@ impl Default for Groups {
             d
         };
         Groups {
-            default: "全部".into(),
+            default: crate::t!("全部", "All").into(),
             list: vec![
-                g("全部", &|_| {}),
-                g("文本", &|d| d.kind = "text".into()),
-                g("图片", &|d| d.kind = "image".into()),
-                g("链接", &|d| d.patterns = vec![r"(?i)^\s*(https?|ftp)://\S+\s*$".into()]),
-                g("固定", &|d| d.pinned = true),
+                g(crate::t!("全部", "All"), &|_| {}),
+                g(crate::t!("文本", "Text"), &|d| d.kind = "text".into()),
+                g(crate::t!("图片", "Images"), &|d| d.kind = "image".into()),
+                g(crate::t!("链接", "Links"), &|d| d.patterns = vec![r"(?i)^\s*(https?|ftp)://\S+\s*$".into()]),
+                g(crate::t!("固定", "Pinned"), &|d| {
+                    d.pinned = true;
+                    d.board = 1;
+                    d.key = "m".into();
+                }),
             ],
         }
     }
@@ -68,6 +87,9 @@ pub const HEADER: &str = r#"# copym 分组。每个 [[group]] 是弹窗顶部的
 #   patterns  正则列表：内容（图片则为识别出的文字）匹配任意一条即属于该组；开头加 (?i) 忽略大小写
 #   apps      正则列表：来源匹配任意一条（来源应用名，Windows / macOS；或同步过来的设备名）
 #   rest      true = “其他”：不属于任何设置了 patterns / apps 的分组的条目
+#   board     固定分组编号（1、2、3…，不能重复）：条目是手动放进来的，不按规则匹配
+#   key       一个字符：弹窗里 ' + key 跳到该分组；固定分组还可以用 m + key 把选中的条目放进来（再按一次取消）
+#   hotkey    固定分组的全局快捷键：不用打开弹窗，把当前剪贴板的内容放进该分组（例如 "Ctrl+Alt+1"，改后重启生效）
 #
 # 一个条目可以同时属于多个分组。default 是打开弹窗时默认选中的分组。
 #
@@ -79,6 +101,12 @@ pub const HEADER: &str = r#"# copym 分组。每个 [[group]] 是弹窗顶部的
 # [[group]]
 # name = "代码"
 # apps = ['(?i)code|idea|terminal|konsole']
+#
+# [[group]]
+# name = "常用回复"
+# board = 2
+# key = "r"
+# hotkey = "Ctrl+Alt+R"
 
 "#;
 
@@ -90,7 +118,7 @@ pub fn to_toml(g: &Groups) -> Result<String, String> {
 pub fn from_toml(s: &str) -> Result<Groups, String> {
     let g: Groups = toml::from_str(s).map_err(|e| e.to_string())?;
     if g.list.is_empty() {
-        return Err("没有任何分组".into());
+        return Err(crate::t!("没有任何分组", "there are no groups").into());
     }
     Ok(g)
 }
@@ -118,6 +146,60 @@ impl Groups {
     pub fn rules(&self) -> Vec<GroupRule> {
         (0..self.list.len()).map(|i| self.rule(i)).collect()
     }
+
+    /// Pin groups: (index in the list, definition).
+    pub fn boards(&self) -> impl Iterator<Item = (usize, &GroupDef)> {
+        self.list.iter().enumerate().filter(|(_, g)| g.board > 0)
+    }
+
+    /// The pin group that `TogglePin` / a bare "pin" uses.
+    pub fn first_board(&self) -> u32 {
+        self.boards().next().map(|(_, g)| g.board).unwrap_or(1)
+    }
+
+    /// Group whose `key` is `c` (pin groups only when `boards_only`).
+    pub fn by_key(&self, c: char, boards_only: bool) -> Option<(usize, &GroupDef)> {
+        self.list.iter().enumerate().find(|(_, g)| (!boards_only || g.board > 0) && g.key.chars().next() == Some(c) && g.key.chars().count() == 1)
+    }
+
+    /// Pin group by number, key or name (for `copym pin`).
+    pub fn find_board(&self, s: &str) -> Option<&GroupDef> {
+        let s = s.trim();
+        self.boards().map(|(_, g)| g).find(|g| g.board.to_string() == s || g.key == s || g.name == s)
+    }
+
+    pub fn board_name(&self, board: u32) -> Option<&str> {
+        self.boards().find(|(_, g)| g.board == board).map(|(_, g)| g.name.as_str())
+    }
+
+    /// A number no pin group uses yet.
+    pub fn next_board(&self) -> u32 {
+        self.list.iter().map(|g| g.board).max().unwrap_or(0) + 1
+    }
+
+    /// Every group valid, and no key / pin number / shortcut used twice.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut names = std::collections::HashSet::new();
+        let mut keys = std::collections::HashSet::new();
+        let mut boards = std::collections::HashSet::new();
+        let mut hotkeys = std::collections::HashSet::new();
+        for g in &self.list {
+            g.validate().map_err(|e| format!("「{}」：{e}", g.name))?;
+            if !names.insert(g.name.trim()) {
+                return Err(crate::tf!("分组名称重复：{}", "duplicate group name: {}", g.name));
+            }
+            if !g.key.is_empty() && !keys.insert(g.key.as_str()) {
+                return Err(crate::tf!("按键 {} 被多个分组使用", "key {} is used by several groups", g.key));
+            }
+            if g.board > 0 && !boards.insert(g.board) {
+                return Err(crate::tf!("固定分组编号 {} 重复", "pin group number {} is used twice", g.board));
+            }
+            if !g.hotkey.trim().is_empty() && !hotkeys.insert(g.hotkey.trim().to_lowercase()) {
+                return Err(crate::tf!("快捷键 {} 被多个分组使用", "shortcut {} is used by several groups", g.hotkey));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl GroupDef {
@@ -133,6 +215,7 @@ impl GroupDef {
             apps: self.apps.clone(),
             exclude: Vec::new(),
             exclude_apps: Vec::new(),
+            board: (self.board > 0).then_some(self.board),
         }
     }
 
@@ -142,7 +225,11 @@ impl GroupDef {
             regex_lite::Regex::new(p).map_err(|e| format!("{p}：{e}"))?;
         }
         if self.name.trim().is_empty() {
-            return Err("分组名称不能为空".into());
+            return Err(crate::t!("分组名称不能为空", "a group needs a name").into());
+        }
+        let n = self.key.chars().count();
+        if n > 1 || self.key.chars().any(char::is_whitespace) {
+            return Err(crate::t!("按键只能是一个字符", "the key must be one character").into());
         }
         Ok(())
     }
@@ -155,7 +242,7 @@ mod tests {
     #[test]
     fn roundtrip_and_rest_rule() {
         let mut g = Groups::default();
-        g.list.push(GroupDef { name: "其他".into(), kind: "text".into(), rest: true, ..Default::default() });
+        g.list.push(GroupDef { name: crate::t!("其他", "Other").into(), kind: "text".into(), rest: true, ..Default::default() });
         g.list.push(GroupDef { name: "IDE".into(), apps: vec!["(?i)code".into()], ..Default::default() });
         let back = from_toml(&to_toml(&g).unwrap()).unwrap();
         assert_eq!(back, g);

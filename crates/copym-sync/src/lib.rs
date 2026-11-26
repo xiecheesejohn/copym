@@ -325,7 +325,7 @@ impl Engine {
     pub fn join(&self, code: &str, addr: Option<SocketAddr>) -> io::Result<String> {
         let code: String = code.chars().filter(char::is_ascii_digit).collect();
         if code.len() != 8 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "配对码应为 8 位数字"));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, copym_core::t!("配对码应为 8 位数字", "the pairing code has 8 digits")));
         }
         let code = format!("{}-{}", &code[..4], &code[4..]);
         let candidates = match addr {
@@ -335,7 +335,7 @@ impl Engine {
         if candidates.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "局域网内没有找到正在配对的设备（可改用 配对码@IP:端口）",
+                copym_core::t!("局域网内没有找到正在配对的设备（可改用 配对码@IP:端口）", "no pairing device found on the LAN (try code@IP:port)"),
             ));
         }
         let mut last_err = None;
@@ -673,7 +673,7 @@ fn pair_initiator(mut stream: TcpStream, code: &str, my_name: &str) -> io::Resul
     let theirs = read_raw(&mut stream)?;
     let key = spake_key(spake.finish(&theirs))?;
     let state = handshake(&mut stream, &key, true, PAIR_PROLOGUE)
-        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "配对码错误或配对已过期"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, copym_core::t!("配对码错误或配对已过期", "wrong pairing code, or pairing expired")))?;
     let (mut tx, mut rx) = split(stream, state)?;
     let offer: PairOffer = rx.recv()?;
     tx.send(&PairAck { name: my_name.to_string() })?;

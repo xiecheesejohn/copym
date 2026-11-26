@@ -46,6 +46,8 @@ pub struct Config {
     pub paste_shortcut: String,
     /// "system", "dark" or "light".
     pub theme: String,
+    /// "auto" (system language), "zh" or "en".
+    pub language: String,
     /// UI font file (.ttf / .otf / .ttc; "~/" allowed). Empty = the system UI
     /// font (PingFang SC, Microsoft YaHei UI, or fontconfig's sans-serif).
     pub font: String,
@@ -56,6 +58,8 @@ pub struct Config {
     pub ocr_engine: String,
     /// Tesseract languages, e.g. "chi_sim+chi_tra+eng" (missing packs are skipped).
     pub ocr_languages: String,
+    /// Look for a newer release once a day (GitHub Releases; nothing is installed automatically).
+    pub check_updates: bool,
     /// LAN sync (end-to-end encrypted). Inactive until paired with `copym sync pair`.
     pub sync_enabled: bool,
     /// Name shown on other devices (empty = host name).
@@ -74,7 +78,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            max_items: 500,
+            max_items: 100_000,
             max_text_bytes: 4 * 1024 * 1024,
             max_image_bytes: 32 * 1024 * 1024,
             store_images: true,
@@ -103,10 +107,12 @@ impl Default for Config {
             paste_on_enter: true,
             paste_shortcut: String::new(),
             theme: "system".into(),
+            language: "auto".into(),
             font: String::new(),
             ocr_enabled: true,
             ocr_engine: "auto".into(),
             ocr_languages: "chi_sim+chi_tra+eng".into(),
+            check_updates: true,
             sync_enabled: true,
             device_name: String::new(),
             sync_port: 47800,
@@ -153,18 +159,73 @@ impl Config {
 /// Write `ignore_apps` into config.toml, keeping the rest of the file (comments
 /// and formatting) as it is.
 pub fn save_ignore_apps(apps: &[String]) -> Result<(), String> {
+    save_values(&[("ignore_apps", list_value(apps))])
+}
+
+/// A TOML array of strings.
+pub fn list_value(items: &[String]) -> toml_edit::Value {
+    toml_edit::Value::Array(items.iter().map(String::as_str).collect())
+}
+
+/// Write these keys into config.toml, keeping the rest of the file (comments
+/// and formatting) as it is.
+pub fn save_values(values: &[(&str, toml_edit::Value)]) -> Result<(), String> {
     let path = config_path();
-    let text = with_ignore_apps(&std::fs::read_to_string(&path).unwrap_or_default(), apps)?;
+    let text = with_values(&std::fs::read_to_string(&path).unwrap_or_default(), values)?;
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    std::fs::write(&path, text).map_err(|e| format!("保存 {} 失败：{e}", path.display()))
+    std::fs::write(&path, text).map_err(|e| tf!("保存 {} 失败：{e}", "Could not save {}: {e}", path.display()))
 }
 
-fn with_ignore_apps(text: &str, apps: &[String]) -> Result<String, String> {
-    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("config.toml 格式有误，未保存：{e}"))?;
-    doc["ignore_apps"] = toml_edit::value(apps.iter().map(String::as_str).collect::<toml_edit::Array>());
+fn with_values(text: &str, values: &[(&str, toml_edit::Value)]) -> Result<String, String> {
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| tf!("config.toml 格式有误，未保存：{e}", "config.toml is invalid, nothing saved: {e}"))?;
+    for (key, value) in values {
+        doc[key] = toml_edit::Item::Value(value.clone());
+    }
     Ok(doc.to_string())
+}
+
+/// Settings the daemon only reads at start.
+pub const RESTART_KEYS: &[&str] = &[
+    "hotkey",
+    "keep_popup_loaded",
+    "poll_interval_ms",
+    "restore_empty_clipboard",
+    "respect_password_hints",
+    "store_images",
+    "max_items",
+    "max_text_bytes",
+    "max_image_bytes",
+    "ocr_enabled",
+    "ocr_engine",
+    "ocr_languages",
+    "check_updates",
+    "sync_enabled",
+    "device_name",
+    "sync_port",
+    "sync_images",
+    "sync_max_image_bytes",
+    "sync_history_items",
+    "sync_peers",
+];
+
+impl Config {
+    /// Every setting as a TOML value, by key.
+    pub fn values(&self) -> Vec<(String, toml_edit::Value)> {
+        let text = toml::to_string(self).unwrap_or_default();
+        let doc: toml_edit::DocumentMut = text.parse().unwrap_or_default();
+        doc.iter().filter_map(|(k, v)| v.as_value().map(|v| (k.to_string(), v.clone()))).collect()
+    }
+
+    /// Keys whose values differ from `other`.
+    pub fn changed(&self, other: &Config) -> Vec<(String, toml_edit::Value)> {
+        let theirs = other.values();
+        self.values()
+            .into_iter()
+            .filter(|(k, v)| theirs.iter().find(|(k2, _)| k2 == k).is_none_or(|(_, v2)| v.to_string().trim() != v2.to_string().trim()))
+            .collect()
+    }
 }
 
 fn host_name() -> Option<String> {
@@ -253,14 +314,25 @@ mod tests {
     #[test]
     fn ignore_apps_keeps_the_rest_of_the_file() {
         let before = "# my notes\ntheme = \"dark\" # inline\nignore_apps = [\"a\"]\n";
-        let after = with_ignore_apps(before, &["微信".into(), "chrome.exe".into()]).unwrap();
+        let after = with_values(before, &[("ignore_apps", list_value(&["微信".into(), "chrome.exe".into()]))]).unwrap();
         assert!(after.contains("# my notes") && after.contains("# inline"), "{after}");
         let cfg: Config = toml::from_str(&after).unwrap();
         assert_eq!(cfg.ignore_apps, ["微信", "chrome.exe"]);
         assert_eq!(cfg.theme, "dark");
         // a new file gets the key too
-        let cfg: Config = toml::from_str(&with_ignore_apps("", &[]).unwrap()).unwrap();
+        let cfg: Config = toml::from_str(&with_values("", &[("ignore_apps", list_value(&[]))]).unwrap()).unwrap();
         assert!(cfg.ignore_apps.is_empty());
-        assert!(with_ignore_apps("not = = toml", &[]).is_err());
+        assert!(with_values("not = = toml", &[]).is_err());
+    }
+
+    #[test]
+    fn changed_keys() {
+        let a = Config::default();
+        let mut b = a.clone();
+        b.theme = "dark".into();
+        b.max_items = 9;
+        let keys: Vec<String> = b.changed(&a).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["max_items", "theme"]);
+        assert!(a.changed(&a.clone()).is_empty());
     }
 }

@@ -15,7 +15,7 @@ pub fn load() -> (Groups, Option<String>) {
     match std::fs::read_to_string(&path) {
         Ok(s) => match copym_core::groups::from_toml(&s) {
             Ok(g) => (g, None),
-            Err(e) => (Groups::default(), Some(format!("{} 有误，已使用默认分组：{e}", path.display()))),
+            Err(e) => (Groups::default(), Some(tf!("{} 有误，已使用默认分组：{e}", "{} is invalid, using the default groups: {e}", path.display()))),
         },
         Err(_) => {
             let g = Groups::default();

@@ -16,13 +16,13 @@
 - **正则搜索**：点搜索框旁的 `.*` 或按 `Ctrl+R` 切换，大小写不敏感；正则错误会即时提示。
 - **搜索图片中的文字（OCR）**：截图等图片在后台低优先级识别文字，之后可以像文本一样搜索（普通/正则均可），预览里显示“图中文字”。
 - **局域网加密同步**：多台设备自动发现、端到端加密，同步过来的内容只进入历史，不会改动当前剪贴板。
-- **存储**：redb（纯 Rust 嵌入式数据库），自动去重，超过上限自动淘汰（固定项除外）。
+- **存储**：SQLite（WAL），按千万条设计：启动不加载历史，列表分页，搜索走 trigram 全文索引，分组计数用增量维护的位图；自动去重，超过上限自动淘汰（固定项除外）。详见下文“存储与性能”。
 
 ## 安装
 
 下载地址：[Releases](https://github.com/xiecheesejohn/copym/releases/latest)（正式版本）；每次提交的最新构建在 GitHub Actions 的构建产物里（需登录 GitHub），版本号后面带提交号，例如 `copym-0.1.0-4011f23-linux-x86_64.tar.gz`。
 
-- **macOS（Apple 芯片）**：下载 `copym-<版本>-macos-aarch64.dmg`，打开后把 copym 拖进“应用程序”。首次打开时系统会提示“无法验证开发者”（没有 Apple 开发者证书签名），到“系统设置 → 隐私与安全性”底部点“仍要打开”即可。之后按 `Option+C` 呼出，也可以在 Spotlight（`⌘空格`）里搜 copym 打开；在操作面板（`⌘K`）里选“登录时自动启动”。
+- **macOS（Apple 芯片）**：下载 `copym-<版本>-macos-aarch64.dmg`，打开后把 copym 拖进“应用程序”。首次打开时系统会提示“无法验证开发者”（没有 Apple 开发者证书签名），到“系统设置 → 隐私与安全性”底部点“仍要打开”即可。之后按 `Option+C` 呼出，也可以在 Spotlight（`⌘空格`）里搜 copym 打开；在设置（`⌘,`）里打开“登录时自动启动”。
 - **Windows**：下载 `copym-<版本>-windows-x86_64.zip`，把里面的 `copym.exe` 解压到固定的目录（例如 `%LOCALAPPDATA%\Programs\copym\`，升级时覆盖同一个文件）运行一次。之后在开始菜单 / Windows 搜索里搜 copym 就能打开（首次运行时自动创建开始菜单快捷方式），然后 `copym autostart on` 开机自启。
 - **Linux**：下载 `copym-<版本>-linux-x86_64.tar.gz`，把里面的 `copym` 放到 `~/.local/bin` 等目录运行一次，然后 `copym autostart on`。
 - **安卓**：按手机架构下载 `copym-<版本>-android-*.apk`（一般选 `arm64-v8a`）。
@@ -63,28 +63,55 @@ copym pin ID            # 固定 / 取消固定
 - 其他 Wayland 桌面（GNOME / Hyprland …）：请在系统设置里把命令 `copym show` 绑定到快捷键。
 
 
-弹窗打开时键盘在列表上（`popup_focus = "list"`），可以直接选择；按 `/`、`Ctrl+F` 或点搜索框才开始输入搜索，搜索时按 `Esc` 回到列表。
+弹窗完全按 Vim 的方式操作，鼠标可选。打开时处于 NORMAL 模式（`popup_focus = "search"` 则直接进入 INSERT），底栏左侧显示当前模式，按 `?` 随时查看全部按键。
 
-弹窗内（macOS 上 Ctrl → ⌘、Alt → ⌥）：
+**NORMAL（列表）**
 
 | 按键 | 作用 |
 |---|---|
-| `↑` `↓` / `PgUp` `PgDn` | 选择 |
-| `j` / `k`，`g` / `G`（列表模式） | 下一条 / 上一条，第一条 / 最后一条 |
-| `1…9`（列表模式）/ `Alt+1…9` | 直接粘贴第 N 条 |
-| `/` / `Ctrl+F` | 开始搜索 |
-| `Ctrl+J` / `Ctrl+K`（Vim） | 下一条 / 上一条 |
-| `Ctrl+N` / `Ctrl+P`（Emacs） | 下一条 / 上一条（macOS 上是 Control 键，不是 ⌘） |
-| `Enter` / 双击 | 粘贴到之前的窗口（`paste_on_enter = false` 时只复制） |
-| `Shift+Enter` | 只复制到剪贴板（`paste_on_enter = false` 时改为粘贴） |
-| `Ctrl+1…9` | 切换到第 N 个分组 |
-| `Tab` / `Shift+Tab` | 下一个 / 上一个分组 |
-| `Ctrl+R` | 切换正则搜索 |
-| `Ctrl+S` | 固定 / 取消固定 |
-| `Alt+K`（macOS `⌘K`）/ 右键 | 打开操作面板：粘贴、复制、在浏览器打开、固定、删除、暂停记录、同步、管理分组、开机自启、退出 |
-| `Shift+Del` / `Ctrl+D` | 删除 |
-| `Ctrl+Q` / 右下角 ⏻ | 退出 copym（守护进程和弹窗） |
-| `Esc` | 搜索中：清空并回到列表；列表中：关闭 |
+| `j` `k` / `↓` `↑` / `Ctrl-n` `Ctrl-p` / `Ctrl-e` `Ctrl-y` | 下一条 / 上一条，可加计数：`5j` |
+| `gg` / `G` / `12G` / `0` `$` | 第一条 / 最后一条 / 第 12 条 |
+| `Ctrl-d` `Ctrl-u` / `Ctrl-f` `Ctrl-b` | 半页 / 整页 |
+| `H` `M` `L` | 跳到可见区顶部 / 中间 / 底部 |
+| `{` `}` | 上一节 / 下一节（已固定、今天、昨天 …） |
+| `Enter` / `p` | 粘贴到之前的窗口（`paste_on_enter = false` 时只复制） |
+| `yy` / `Y` / `Shift+Enter` | 只复制到剪贴板 |
+| `dd` / `x` | 删除 |
+| `m{x}` / `mm` | 放进按键为 x 的固定分组（再按一次取消）/ 放进默认的“固定”分组 |
+| `'{x}` | 跳到按键为 x 的分组（像 Vim 的标记） |
+| `o` | 打开链接（浏览器）或路径（文件管理器） |
+| `/` / `i` | 搜索（`/` 清空后重新输入，`i` 保留关键词） |
+| `gt` `gT` / `Tab` `Shift+Tab` / `3gt` | 下一个 / 上一个 / 第 3 个分组 |
+| `Space` | 操作菜单：每项有一个字母，按下直接执行（`p` 粘贴、`y` 复制、`m` 固定（有多个固定分组时，每个分组一行）、`d` 删除、`b` 不再记录该应用、`r` 暂停记录、`t` 切换外观、`s` 同步、`g` 分组、`,` 设置、`u` 检查更新、`Q` 退出） |
+| `:` | 命令行（见下表） |
+| `?` | 按键帮助 |
+| `Esc` | 依次：取消计数 → 清空搜索 → 关闭 |
+| `q` / `ZZ` / `ZQ` | 关闭弹窗 |
+
+**INSERT（搜索框）**：直接输入；`Esc`（或 `Ctrl-[`）回到 NORMAL 并保留关键词；`Ctrl-j` `Ctrl-k` / `↓` `↑` 选择；`Ctrl-u` 清空，`Ctrl-w` 删除一个词；`Enter` 粘贴。
+
+**COMMAND（`:`）**
+
+| 命令 | 作用 |
+|---|---|
+| `:q` / `:q!` `:qa` | 关闭弹窗 / 退出 copym |
+| `:12` | 跳到第 12 条 |
+| `:set bg=dark` `light` `system`（或 `:colo dark`） | 外观 |
+| `:set lang=zh` `en` `auto` | 界面语言 |
+| `:set regex` / `:set noregex` | 正则搜索 |
+| `:g 2` / `:g 链接` / `:bn` `:bp` | 切换分组 |
+| `:settings` `:sync` `:groups` `:pause` `:resume` `:update` `:help` | 打开对应界面 / 执行 |
+| `:y` `:p` `:d` `:pin` / `:noh` | 复制、粘贴、删除、固定当前条目 / 清空搜索 |
+
+对话框里同样是 Vim 键：设置（`Ctrl+,`、`:settings` 或菜单里的 `,`）用 `j` `k` 选行、`h` `l` 改值、`Space` 切换开关、`i` 编辑文本、`Tab` / `gt` 切换分类、`Ctrl-S` 保存、`ZZ` 保存并关闭、`q` / `Esc` 关闭；管理分组用 `j` `k` 切换分组、`Ctrl-S` 保存。文本框里按 `Esc` 只退出编辑。
+
+始终可用：`Alt+1…9` 直接粘贴第 N 条，`Ctrl+1…9` 切换分组，`Alt+R` 切换正则，`Alt+K` 打开菜单，`Ctrl+Q` 退出（macOS 上分别是 `⌥`、`⌘`；`⌘S` 固定、`⌘D` 删除、`⌘F` 搜索也保留）。
+
+### 外观和语言
+
+界面是终端风格：等宽字体、黑底磷光绿（深色）或米白纸质终端（浅色），默认跟随系统切换深浅色（Linux 通过 XDG 桌面门户读取并实时跟随）。在菜单里按 `t`、用 `:set bg=dark` 或在设置里手动切换。
+
+界面语言支持中文和英文，默认跟随系统语言（`language = "auto"`），可用 `:set lang=en` 或在设置里切换，命令行输出、错误提示也随之切换。
 
 ### 自动粘贴
 
@@ -122,13 +149,36 @@ rest = true              # 不属于任何带 patterns / apps 的分组
 
 其他字段：`pinned = true` 只包含固定的条目。正则开头加 `(?i)` 忽略大小写。
 
+### 固定分组
+
+固定分组里的条目不按规则匹配，而是手动放进去的。可以建多个，例如“常用回复”“服务器”。每个条目同一时间只在一个固定分组里；固定的条目不会因为超出保存上限被淘汰。
+
+```toml
+[[group]]
+name = "固定"            # 默认就有：按键 m，所以 mm 就是固定 / 取消固定
+pinned = true
+board = 1
+key = "m"
+
+[[group]]
+name = "常用回复"
+board = 2               # 固定分组编号，不能重复（管理器里勾选“固定分组”会自动分配）
+key = "r"               # 弹窗里 mr 放进来，'r 跳过来
+hotkey = "Ctrl+Alt+R"   # 全局快捷键：不打开弹窗，直接把当前剪贴板的内容放进来
+```
+
+- **弹窗里**：选中条目后按 `m` + 分组的按键，就放进那个分组；在同一个分组上再按一次就取消固定。按 `m` 后底栏会列出所有可选的分组。也可以用 `Space` 菜单，或输入 `:pin r`、`:unpin`。
+- **全局快捷键**：在任何程序里复制后按分组的 `hotkey`，刚复制的内容（也就是历史里最新的一条）就会放进该分组。在管理器里改快捷键后，重启 copym（`:restart` 或 `copym restart`）才生效。
+- **命令行**：`copym pin-current [分组]`，分组可以写按键、名称或编号，不写就用第一个固定分组。在没有全局快捷键的 Linux 桌面（GNOME 等）上，可以把这条命令绑定到系统快捷键。KDE 上会自动注册为系统全局快捷键。
+- **`board` / `key` / `hotkey` 字段**：在安卓端编辑分组时会原样保留，但安卓端目前只显示固定分组，没有设置这些字段的界面。
+
 ## 配置
 
 `~/.config/copym/config.toml`（Windows：`%APPDATA%\copym\config.toml`，macOS：`~/Library/Application Support/copym/config.toml`），首次运行时生成。
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `max_items` | 500 | 非固定项的最大数量 |
+| `max_items` | 100000 | 非固定项的最大数量 |
 | `max_text_bytes` / `max_image_bytes` | 4 MB / 32 MB | 超过则不记录 |
 | `store_images` | true | 是否记录图片 |
 | `hotkey` | `Alt+C` | 全局快捷键（macOS 上 Alt = Option） |
@@ -141,8 +191,10 @@ rest = true              # 不属于任何带 patterns / apps 的分组
 | `popup_focus` | list | 打开弹窗时键盘在 `list`（列表）还是 `search`（搜索框） |
 | `paste_on_enter` | true | `Enter` 自动粘贴到之前的窗口；false 时只复制 |
 | `paste_shortcut` | （空 = `ctrl+v` / macOS `cmd+v`） | 粘贴时模拟的按键 |
-| `theme` | system | system / dark / light |
-| `font` | （空 = 系统界面字体） | 界面字体文件路径（.ttf / .otf / .ttc，可用 `~/`）；默认 macOS 苹方、Windows 微软雅黑 UI、Linux fontconfig 的中文 sans-serif |
+| `theme` | system | system（跟随系统）/ dark / light |
+| `language` | auto | auto（跟随系统）/ zh / en |
+| `font` | （空 = 内置等宽字体） | 界面字体文件路径（.ttf / .otf / .ttc，可用 `~/`），例如喜欢的等宽字体；中文仍用系统字体（macOS 苹方、Windows 微软雅黑 UI、Linux fontconfig） |
+| `check_updates` | true | 每天检查一次 GitHub Releases 上的新版本（只提示，不自动安装；也可 `copym update` 或操作面板“检查更新”） |
 | `ocr_enabled` | true | 识别图片中的文字 |
 | `ocr_engine` | auto | auto / native / ppocr（Linux 内置）/ tesseract / off |
 | `ocr_languages` | chi_sim+chi_tra+eng | Tesseract 语言（未安装的自动跳过；内置引擎不需要） |
@@ -235,6 +287,45 @@ cd android && ./gradlew assembleRelease   # Gradle 会先调用 cargo-ndk 编译
 
 未设置 `COPYM_KEYSTORE` 等签名环境变量时，release 包使用本机 debug 密钥签名，适合自用；不同机器打出的包签名不同，不能互相覆盖安装。
 
+## 存储与性能
+
+历史存在数据目录的 `history.sqlite`（SQLite，WAL 模式），按 1000 万条设计。要保留这么多条，把 `max_items` 调大（默认 10 万）。
+
+- **启动不加载历史**：只读两个计数器；列表按“时间 + id”分页，界面滚到哪里取到哪里。
+- **id 即时间**：`id = 复制时间 << 20 | 序号`，倒序遍历主键就是最新优先；其他设备同步来的条目按原时间插到对应位置。
+- **冷热分离**（借鉴 ClickHouse）：`items` 表只放元数据；正文单独一张表，超过 256 字节用 LZ4 压缩，只在预览、搜索命中和规则判断时读取。预览不另存，从正文截取。
+- **搜索**：FTS5 trigram 索引，任意子串、中英文都能用。
+  - 索引用 `detail=none` 且不存原文，大小约为正文的 0.9 倍（常规全文索引是 2–3 倍）。
+  - 每个候选都会回到原文再核对一遍，索引只负责缩小范围。
+  - 多个词时，先用全部 trigram 精确查询 30 ms；查不完就改用“最少见的那个 trigram + 原文核对”，按时间窗口往前推进。原因是 FTS5 的 AND 查询在完全没有结果时会走完整个索引，单个词才能按范围停下。
+  - 1–2 个字的词和正则无法用索引，就从新到旧扫描。
+  - 每次请求最多 80 ms，到时间先返回已找到的，界面继续取下一页（底栏显示“搜索中…”）。
+- **分组计数**（类似物化视图）：
+  - 按内容或来源应用正则定义的分组，成员关系存在 `members` 表，和每次写入在同一个事务里更新，崩溃也不会不一致。新规则在后台分小步建立。
+  - 只按类型或固定状态定义的分组直接用索引和计数器。
+  - 搜索时的计数只统计前 1000 个结果，显示为 “1000+”。
+- **没采用的方案**：DuckDB 和 ClickHouse 都是列存分析引擎，擅长批量扫描和聚合，但不适合这里的场景（逐条写入、按 id 读写、子串搜索中文）；而且体积大（ClickHouse 还需要单独的服务）。上面采用的是它们的思路：冷热分离、压缩、跳过无关数据、物化视图、限时并逐步返回结果。
+
+压测：`cargo run --release -p copym-core --example bench -- 10000000 <路径>`。以下是本机的数据：Linux，NVMe，数据已在系统缓存中；生成的数据平均每条约 410 字节，同步来的条目不计入。
+
+| 1000 万条 | 结果 |
+|---|---|
+| 数据库大小 | 7.9 GB（原文约 4.1 GB） |
+| 启动 | 0.3 ms，内存 5 MB |
+| 第一页 / 下一页（200 条） | 0.6 ms / 0.4 ms |
+| 搜索：常见词 / 少见词 / 中文 / 单字 | p95 1.8 / 1.6 / 1.3 / 1.5 ms |
+| 正则 | 到 80 ms 先返回部分结果，然后继续扫描 |
+| 新增一条 | p50 0.2 ms，p95 2.2 ms |
+| 分组计数 / 稀疏分组翻页 | 0.0 ms / 0.5 ms |
+| 新分组规则后台建立 | 约 14 秒（建立过程中计数显示 “n+”） |
+| 常驻内存 | 25 MB |
+
+**最慢的情况**：搜索结果为空时，要查完全部历史才能确定没有。
+- 两个常见词从不同时出现：约 13 秒。
+- 正则查不到：约 76 秒（要解压并核对全部正文）。
+
+这期间界面不卡：每 80 ms 刷新一次，结果边找边显示。
+
 ## 测试
 
 ```sh
@@ -258,8 +349,15 @@ src/
   filter.rs        应用 / 正则 / 大小过滤
   ocr.rs           图片文字识别（Vision / Windows.Media.Ocr / 内置 PP-OCR / Tesseract）
   ppocr.rs         Linux 内置 OCR：PP-OCRv6 tiny on tract（模型在 models/ppocr/）
+  update.rs        检查新版本（GitHub Releases，系统 curl）
+  gui/settings.rs  设置界面（每项一个图标，Vim 键操作）
+  gui/vim.rs       Vim 键位：NORMAL / INSERT / COMMAND、:命令、按键帮助
+  gui/shots.rs     离屏渲染界面截图的测试（COPYM_SHOTS=目录）
+  icons.rs         图标（Lucide 子集，assets/fonts/copym-icons.ttf）
+  system_theme.rs  Linux：通过 XDG 桌面门户跟随系统深浅色
   kde_hotkey.rs    KDE 全局快捷键（KGlobalAccel D-Bus）
-crates/copym-core/ 桌面与安卓共用：历史存储（redb + 内存索引）、数据模型、PNG 工具
+crates/copym-core/ 桌面与安卓共用：历史存储（SQLite + FTS5 trigram + roaring 位图）、数据模型、PNG 工具
+  examples/bench.rs 存储压测（生成 N 条假数据，测启动 / 翻页 / 搜索 / 写入 / 计数 / 内存）
 crates/copym-sync/ 局域网加密同步核心（平台无关）
   channel.rs       Noise 加密通道与分帧
   identity.rs      设备 ID / 组密钥持久化

@@ -96,6 +96,11 @@ data class GroupDef(
     val apps: List<String> = emptyList(),
     /** "Everything else": not caught by any group that has patterns/apps. */
     val rest: Boolean = false,
+    /** Pin group number (> 0 = items are put here by hand), set on the desktop. */
+    val board: Int = 0,
+    /** Desktop popup key and global shortcut; kept so saving here doesn't drop them. */
+    val key: String = "",
+    val hotkey: String = "",
 )
 
 data class Groups(val default: String, val list: List<GroupDef>) {
@@ -118,6 +123,9 @@ fun parseGroups(json: String): Groups {
                 patterns = g.optJSONArray("patterns").strings(),
                 apps = g.optJSONArray("apps").strings(),
                 rest = g.optBoolean("rest"),
+                board = g.optInt("board", 0),
+                key = g.optString("key", ""),
+                hotkey = g.optString("hotkey", ""),
             )
         },
     )
@@ -134,6 +142,9 @@ fun Groups.toJson(): String = JSONObject().apply {
                 put("patterns", JSONArray(g.patterns))
                 put("apps", JSONArray(g.apps))
                 put("rest", g.rest)
+                if (g.board > 0) put("board", g.board)
+                if (g.key.isNotEmpty()) put("key", g.key)
+                if (g.hotkey.isNotEmpty()) put("hotkey", g.hotkey)
             })
         }
     })

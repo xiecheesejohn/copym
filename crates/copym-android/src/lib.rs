@@ -70,6 +70,8 @@ pub extern "system" fn Java_io_github_xiecheesejohn_copym_Native_open<'l>(
         if APP.get().is_some() {
             return Ok(());
         }
+        // messages from the core follow the phone's language
+        copym_core::i18n::set_lang(copym_core::i18n::Lang::resolve("auto", sys_locale::get_locale().as_deref()));
         let dir = get_string(env, &data_dir)?;
         let name = get_string(env, &device_name)?;
         let peers = get_string(env, &peers)?;

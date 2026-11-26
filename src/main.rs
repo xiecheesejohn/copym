@@ -1,6 +1,9 @@
 // No console window on Windows (CLI commands re-attach to the parent console).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[macro_use]
+extern crate copym_core;
+
 use copym_core::{imgutil, model, store};
 
 mod autostart;
@@ -10,13 +13,17 @@ mod daemon;
 mod filter;
 mod groups;
 mod gui;
+mod icons;
 mod ipc;
 #[cfg(target_os = "linux")]
 mod kde_hotkey;
 mod ocr;
 mod paste;
 #[cfg(target_os = "linux")]
+mod system_theme;
+#[cfg(target_os = "linux")]
 mod ppocr;
+mod update;
 
 use model::{Filter, Kind, Request, Response};
 
@@ -31,7 +38,8 @@ COMMANDS:
     list [N]        Print the latest N items (default 20)
     select ID       Put item ID back on the clipboard
     delete ID       Delete item ID (also on synced devices)
-    pin ID          Pin / unpin item ID
+    pin ID [GROUP]  Pin / unpin item ID (GROUP: pin group key, name or number)
+    pin-current [GROUP]  Put the current clipboard into a pin group (bind it to a shortcut)
     search [-r] Q   Search text and text inside images (-r: regular expression)
     pause | resume  Stop / restart recording
     clear           Remove all non-pinned items
@@ -46,6 +54,8 @@ COMMANDS:
     ocr models      Download high-accuracy Tesseract models (Linux; Tesseract engine)
     ocr redo        Recognize all stored images again
     autostart on|off  Start the daemon at login
+    update          Check for a newer release
+    restart         Restart the daemon (after changing settings)
     config          Print the config file path
     help            Show this help
 ";
@@ -55,6 +65,7 @@ pub static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock:
 
 fn main() {
     START.get_or_init(std::time::Instant::now);
+    init_language(&config::Config::load().language);
     // Older macOS versions pass "-psn_…" when an .app is opened from Finder.
     let args: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("-psn_")).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("show");
@@ -83,10 +94,12 @@ fn main() {
             Some(id) => simple(Request::Delete { id }),
             None => Err("usage: copym delete ID".into()),
         },
-        "pin" | "unpin" => match args.get(1).and_then(|n| n.parse().ok()) {
-            Some(id) => simple(Request::TogglePin { id }),
-            None => Err("usage: copym pin ID".into()),
+        "pin" | "unpin" => match (args.get(1).and_then(|n| n.parse().ok()), args.get(2)) {
+            (Some(id), None) => simple(Request::TogglePin { id }),
+            (Some(id), Some(g)) => find_board(Some(g)).and_then(|board| simple(Request::SetPin { id, board })),
+            (None, _) => Err("usage: copym pin ID [GROUP]".into()),
         },
+        "pin-current" => find_board(args.get(1)).and_then(|board| simple(Request::PinLatest { board })),
         "select" => match args.get(1).and_then(|n| n.parse().ok()) {
             Some(id) => simple(Request::Activate { id }),
             None => Err("usage: copym select ID".into()),
@@ -101,6 +114,18 @@ fn main() {
             Some("on") => autostart::set(true).map(|p| println!("autostart enabled: {p}")),
             Some("off") => autostart::set(false).map(|p| println!("autostart disabled: {p}")),
             _ => Err("usage: copym autostart on|off".into()),
+        },
+        "restart" => restart(),
+        "update" => match update::check() {
+            Ok(Some(u)) => {
+                println!("copym {} is available (this is {}): {}", u.version, env!("CARGO_PKG_VERSION"), u.url);
+                Ok(())
+            }
+            Ok(None) => {
+                println!("copym {} is up to date", env!("CARGO_PKG_VERSION"));
+                Ok(())
+            }
+            Err(e) => Err(e),
         },
         "config" => {
             config::Config::load(); // writes the default file if missing
@@ -128,21 +153,28 @@ fn ocr_cmd(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("models") => {
             let langs = args.get(1).cloned().unwrap_or_else(|| cfg.ocr_languages.clone());
-            println!("下载 Tesseract 高精度模型（tessdata_best）：{langs}");
+            println!("{}", tf!("下载 Tesseract 高精度模型（tessdata_best）：{langs}", "downloading the accurate Tesseract models (tessdata_best): {langs}"));
             let dir = ocr::download_models(&langs)?;
-            println!("完成：{}\n重启守护进程后生效（copym quit && copym），然后运行 copym ocr redo 重新识别已有图片。", dir.display());
+            println!(
+                "{}",
+                tf!(
+                    "完成：{}\n重启守护进程后生效（copym restart），然后运行 copym ocr redo 重新识别已有图片。",
+                    "done: {}\nrestart copym (copym restart), then run copym ocr redo to recognize stored images again.",
+                    dir.display()
+                )
+            );
             Ok(())
         }
         Some("redo") => match client()?.request(&Request::RedoOcr).map_err(|e| e.to_string())? {
             Response::Counts(c) => {
-                println!("正在后台重新识别 {} 张图片", c.first().copied().flatten().unwrap_or(0));
+                println!("{}", tf!("正在后台重新识别 {} 张图片", "recognizing {} images again in the background", c.first().copied().flatten().unwrap_or(0)));
                 Ok(())
             }
             Response::Err(e) => Err(e),
             _ => Err("unexpected response".into()),
         },
         Some(path) => {
-            let o = ocr::Ocr::detect(&cfg).ok_or("没有可用的 OCR 引擎（ocr_enabled / ocr_engine 配置）")?;
+            let o = ocr::Ocr::detect(&cfg).ok_or(t!("没有可用的 OCR 引擎（ocr_enabled / ocr_engine 配置）", "no OCR engine available (see ocr_enabled / ocr_engine)"))?;
             let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
             let t = std::time::Instant::now();
             let text = o.recognize(&bytes)?;
@@ -150,12 +182,33 @@ fn ocr_cmd(args: &[String]) -> Result<(), String> {
             println!("{text}");
             Ok(())
         }
-        None => Err("用法：copym ocr FILE.png | copym ocr models [chi_sim+eng] | copym ocr redo".into()),
+        None => Err(t!("用法：copym ocr FILE.png | copym ocr models [chi_sim+eng] | copym ocr redo", "usage: copym ocr FILE.png | copym ocr models [chi_sim+eng] | copym ocr redo").into()),
     }
 }
 
 fn client() -> Result<ipc::Client, String> {
     ipc::Client::connect().map_err(|e| format!("daemon not running ({e}); start it with `copym daemon`"))
+}
+
+/// Stop the running daemon (and popup), wait until it is gone, start a new one.
+fn restart() -> Result<(), String> {
+    if let Ok(mut c) = ipc::Client::connect() {
+        let _ = c.request(&Request::Quit);
+        let gone = (0..50).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            ipc::Client::connect().is_err()
+        });
+        if !gone {
+            return Err(t!("旧的 copym 没有退出", "the running copym did not quit").into());
+        }
+    }
+    daemon::ensure_running()
+}
+
+/// UI language for this process: the `language` setting, or the system's.
+pub fn init_language(setting: &str) {
+    use copym_core::i18n::{set_lang, Lang};
+    set_lang(Lang::resolve(setting, sys_locale::get_locale().as_deref()));
 }
 
 fn show() -> Result<(), String> {
@@ -179,6 +232,18 @@ fn simple(req: Request) -> Result<(), String> {
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+/// Pin group number from a key / name / number (`None` = the first pin group).
+fn find_board(arg: Option<&String>) -> Result<u32, String> {
+    let (g, _) = groups::load();
+    match arg {
+        None => Ok(g.first_board()),
+        Some(a) => g.find_board(a).map(|d| d.board).ok_or_else(|| {
+            let known: Vec<String> = g.boards().map(|(_, d)| format!("{} ({})", d.name, if d.key.is_empty() { d.board.to_string() } else { d.key.clone() })).collect();
+            tf!("没有这个固定分组：{a}（现有：{}）", "no such pin group: {a} (there are: {})", known.join(", "))
+        }),
     }
 }
 
@@ -218,7 +283,7 @@ fn sync_cmd(args: &[String]) -> Result<(), String> {
                 Some((c, a)) => (c.to_string(), Some(a.to_string())),
                 None => (arg.clone(), None),
             };
-            println!("正在查找并连接正在配对的设备…");
+            println!("{}", t!("正在查找并连接正在配对的设备…", "looking for the pairing device…"));
             Request::SyncJoin { code, addr }
         }
         Some("leave") => Request::SyncLeave,
@@ -228,18 +293,19 @@ fn sync_cmd(args: &[String]) -> Result<(), String> {
         Response::Err(e) => Err(e),
         Response::Sync(s) => {
             if !s.enabled {
-                println!("同步：已关闭（config.toml 中 sync_enabled = false）");
+                println!("{}", t!("同步：已关闭（config.toml 中 sync_enabled = false）", "sync: off (sync_enabled = false in config.toml)"));
                 return Ok(());
             }
-            println!("本机：    {}  (端口 {}, id {})", s.device_name, s.port, &s.device_id[..8.min(s.device_id.len())]);
-            println!("状态：    {}", if s.paired { "已加入同步组" } else { "未配对 - 运行 `copym sync pair` 添加设备" });
+            println!("{}", tf!("本机：    {}  (端口 {}, id {})", "device:  {}  (port {}, id {})", s.device_name, s.port, &s.device_id[..8.min(s.device_id.len())]));
+            let state = if s.paired { t!("已加入同步组", "in a sync group") } else { t!("未配对 - 运行 `copym sync pair` 添加设备", "not paired - run `copym sync pair` to add a device") };
+            println!("{}", tf!("状态：    {state}", "state:   {state}"));
             if let Some(c) = s.pairing_code {
-                println!("配对中：  {c}");
+                println!("{}", tf!("配对中：  {c}", "pairing: {c}"));
             }
             if s.peers.is_empty() {
-                println!("已连接：  无");
+                println!("{}", t!("已连接：  无", "peers:   none"));
             } else {
-                println!("已连接：");
+                println!("{}", t!("已连接：", "peers:"));
                 for (name, addr) in s.peers {
                     println!("  - {name}  ({addr})");
                 }
@@ -247,19 +313,19 @@ fn sync_cmd(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Response::Pairing { code, addrs, expires_secs } => {
-            println!("在另一台设备上运行：\n\n    copym sync join {code}\n");
+            println!("{}", tf!("在另一台设备上运行：\n\n    copym sync join {code}\n", "on the other device run:\n\n    copym sync join {code}\n"));
             if let Some(a) = addrs.first() {
-                println!("如果找不到设备（局域网屏蔽了 mDNS），改用：\n\n    copym sync join {code}@{a}\n");
+                println!("{}", tf!("如果找不到设备（局域网屏蔽了 mDNS），改用：\n\n    copym sync join {code}@{a}\n", "if it is not found (mDNS blocked), use:\n\n    copym sync join {code}@{a}\n"));
             }
-            println!("配对码 {} 分钟内有效，只能尝试一次。", expires_secs / 60);
+            println!("{}", tf!("配对码 {} 分钟内有效，只能尝试一次。", "the code is valid for {} minutes, one attempt.", expires_secs / 60));
             Ok(())
         }
         Response::Joined { name } => {
-            println!("已与 {name} 配对，开始同步。");
+            println!("{}", tf!("已与 {name} 配对，开始同步。", "paired with {name}, syncing."));
             Ok(())
         }
         _ => {
-            println!("已退出同步组。");
+            println!("{}", t!("已退出同步组。", "left the sync group."));
             Ok(())
         }
     }

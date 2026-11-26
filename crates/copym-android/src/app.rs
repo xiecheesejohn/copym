@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const MAX_ITEMS: usize = 500;
+pub const MAX_ITEMS: usize = 100_000;
 pub const MAX_TEXT_BYTES: usize = 2 << 20;
 pub const MAX_IMAGE_BYTES: usize = 8 << 20;
 const SYNC_HISTORY_ITEMS: usize = 200;
@@ -43,7 +43,7 @@ impl App {
             .collect();
         let dir = PathBuf::from(data_dir);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let store = Store::open(&dir.join("history.redb"), MAX_ITEMS)?;
+        let store = Store::open(&dir.join("history.sqlite"), MAX_ITEMS)?;
         let groups_path = dir.join("groups.toml");
         let groups = std::fs::read_to_string(&groups_path).ok().and_then(|s| groups::from_toml(&s).ok()).unwrap_or_default();
         let app = Arc::new(App {
@@ -101,15 +101,9 @@ impl App {
     pub fn set_groups(&self, json: &str) -> R<()> {
         let g: Groups = serde_json::from_str(json).map_err(|e| e.to_string())?;
         if g.list.is_empty() {
-            return Err("至少需要一个分组".into());
+            return Err(copym_core::t!("至少需要一个分组", "at least one group is needed").into());
         }
-        let mut names = std::collections::HashSet::new();
-        for d in &g.list {
-            d.validate().map_err(|e| format!("「{}」：{e}", d.name))?;
-            if !names.insert(d.name.trim().to_string()) {
-                return Err(format!("分组名称重复：{}", d.name));
-            }
-        }
+        g.validate()?;
         let tmp = self.groups_path.with_extension("toml.tmp");
         std::fs::write(&tmp, groups::to_toml(&g)?).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &self.groups_path).map_err(|e| e.to_string())?;
@@ -123,7 +117,7 @@ impl App {
         let q = Query::parse(query, regex)?;
         let rule = usize::try_from(index).ok().map(|i| self.groups.lock().unwrap().rule(i)).filter(|r| *r != GroupRule::default());
         let m = rule.as_ref().map(GroupMatcher::new).transpose()?;
-        let items: Vec<Value> = self.store.lock().unwrap().list_group(&q, m.as_ref(), limit).iter().map(meta_json).collect();
+        let items: Vec<Value> = self.store.lock().unwrap().list_group(&q, m.as_ref(), None, limit).items.iter().map(meta_json).collect();
         Ok(Value::Array(items).to_string())
     }
 
@@ -142,13 +136,13 @@ impl App {
 
     fn count_rules(&self, q: &Query, rules: &[GroupRule]) -> Vec<Option<u32>> {
         let ms: Vec<_> = rules.iter().map(|r| GroupMatcher::new(r).ok()).collect();
-        self.store.lock().unwrap().group_counts(q, &ms)
+        self.store.lock().unwrap().group_counts(q, &ms).counts
     }
 
     /// Full content prepared for the preview:
     /// `{"type", "text"?, "pretty"?, "color"?: {"argb", "values": [[k, v]...]}}`.
     pub fn detail(&self, id: u64) -> R<String> {
-        let Some(content) = self.store.lock().unwrap().get(id)? else { return Err("条目不存在".into()) };
+        let Some(content) = self.store.lock().unwrap().get(id)? else { return Err(copym_core::t!("条目不存在", "no such item").into()) };
         Ok(match content {
             Content::Image { width, height, .. } => json!({ "type": "image", "w": width, "h": height }),
             Content::Text(t) => {
@@ -247,7 +241,7 @@ impl App {
     }
 
     fn engine(&self) -> R<&Engine> {
-        self.sync.get().ok_or_else(|| "同步不可用".to_string())
+        self.sync.get().ok_or_else(|| copym_core::t!("同步不可用", "sync is unavailable").to_string())
     }
 
     pub fn sync_status(&self) -> String {
@@ -279,7 +273,7 @@ impl App {
     /// `code` may carry an address: `1234-5678@192.168.1.5:47800`.
     pub fn join(&self, code: &str) -> R<String> {
         let (code, addr) = match code.trim().split_once('@') {
-            Some((c, a)) => (c.trim(), Some(a.trim().parse().map_err(|_| format!("地址无效：{a}"))?)),
+            Some((c, a)) => (c.trim(), Some(a.trim().parse().map_err(|_| copym_core::tf!("地址无效：{a}", "invalid address: {a}"))?)),
             None => (code.trim(), None),
         };
         let name = self.engine()?.join(code, addr).map_err(|e| e.to_string())?;

@@ -21,21 +21,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const ROW_H: f32 = 40.0;
-const SECTION_H: f32 = 30.0;
+mod settings;
+mod vim;
+use vim::Mode;
+#[cfg(test)]
+mod shots;
+use settings::Settings;
+
+const ROW_H: f32 = 30.0;
+const SECTION_H: f32 = 28.0;
 const SEARCH_H: f32 = 56.0;
 const FOOTER_H: f32 = 40.0;
-const LIST_LIMIT: u32 = 1000;
+/// Items per page; more load as the list nears its end.
+const PAGE: u32 = 200;
 const PREVIEW_MAX_SIDE: u32 = 2048;
 
 #[cfg(target_os = "macos")]
 const KEY_GROUP: &str = "⌘";
 #[cfg(not(target_os = "macos"))]
 const KEY_GROUP: &str = "Ctrl+";
-#[cfg(target_os = "macos")]
-const KEY_ACTIONS: &str = "⌘K";
-#[cfg(not(target_os = "macos"))]
-const KEY_ACTIONS: &str = "Alt+K";
 
 /// What the popup asks for once its window is gone.
 #[derive(Default)]
@@ -138,7 +142,7 @@ pub fn host() -> Result<(), String> {
         shown = true;
         open.store(false, Ordering::SeqCst);
         match after {
-            Ok(after) => notice = finish(&after, prev.as_deref()).map(|e| format!("自动粘贴失败：{e}（内容已在剪贴板）")),
+            Ok(after) => notice = finish(&after, prev.as_deref()).map(|e| tf!("自动粘贴失败：{e}（内容已在剪贴板）", "auto paste failed: {e} (the content is on the clipboard)")),
             Err(e) => {
                 eprintln!("copym: popup: {e}");
                 return Err(e);
@@ -225,6 +229,11 @@ fn open_window(
             if open == "actions" {
                 app.actions = Some(0);
             }
+            if let Some(section) = open.strip_prefix("settings") {
+                let mut st = Settings::new(&app.cfg, app.autostart);
+                st.section = section.trim_start_matches(':').parse().unwrap_or(0);
+                app.settings = Some(st);
+            }
             if open == "groups" {
                 app.editor = Some(Editor::new(&app.groups, app.group));
             }
@@ -239,10 +248,11 @@ fn open_window(
 /// Fonts, theme and widget style (once per egui context).
 fn setup_ctx(ctx: &egui::Context, cfg: &Config) {
     install_fonts(ctx, &cfg.font);
-    match cfg.theme.as_str() {
-        "dark" => ctx.set_theme(egui::ThemePreference::Dark),
-        "light" => ctx.set_theme(egui::ThemePreference::Light),
-        _ => ctx.set_theme(egui::ThemePreference::System),
+    // Linux: follow the desktop's light/dark setting (see `App::wants_dark`).
+    #[cfg(target_os = "linux")]
+    {
+        let ctx = ctx.clone();
+        crate::system_theme::watch(move || ctx.request_repaint());
     }
     ctx.all_styles_mut(|s| {
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
@@ -250,8 +260,9 @@ fn setup_ctx(ctx: &egui::Context, cfg: &Config) {
         s.spacing.scroll.bar_width = 6.0;
         s.spacing.scroll.floating = true;
         s.interaction.selectable_labels = false;
-        s.visuals.window_corner_radius = CornerRadius::same(12);
-        s.visuals.menu_corner_radius = CornerRadius::same(10);
+        s.visuals.window_corner_radius = CornerRadius::same(2);
+        s.visuals.menu_corner_radius = CornerRadius::same(2);
+        s.visuals.text_cursor.blink = true;
         for w in [
             &mut s.visuals.widgets.inactive,
             &mut s.visuals.widgets.hovered,
@@ -259,7 +270,7 @@ fn setup_ctx(ctx: &egui::Context, cfg: &Config) {
             &mut s.visuals.widgets.noninteractive,
             &mut s.visuals.widgets.open,
         ] {
-            w.corner_radius = CornerRadius::same(7);
+            w.corner_radius = CornerRadius::same(2);
         }
     });
 }
@@ -307,21 +318,58 @@ fn restore_focus(prev: Option<&str>) {
 /// assets/fonts). System fonts lack some of them (⏎ ⇧ ⌥ on macOS) and egui drew them as boxes.
 static SYMBOLS_FONT: &[u8] = include_bytes!("../assets/fonts/copym-symbols.ttf");
 
+/// Lucide icons (ISC license, see assets/fonts), drawn with `icon()`.
+static ICONS_FONT: &[u8] = include_bytes!("../assets/fonts/copym-icons.ttf");
+
+fn icon_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("icons".into()))
+}
+
+
 /// UI font: `font` from the config, else the platform's own UI font with CJK
 /// (PingFang SC, Microsoft YaHei UI, fontconfig's sans-serif for zh-cn).
 /// egui's bundled fonts stay as fallback (they have no CJK glyphs).
 fn install_fonts(ctx: &egui::Context, custom: &str) {
     let mut fonts = FontDefinitions::default();
-    if let Some((bytes, index)) = find_ui_font(custom) {
+    // Terminal look: one monospace face for everything. egui's Hack for
+    // Latin, the system CJK font after it, then emoji and icon fallbacks.
+    let mono = fonts.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
+    let mut family = Vec::new();
+    if let Some((bytes, index)) = custom_font(custom) {
+        let mut data = FontData::from_owned(bytes);
+        data.index = index;
+        fonts.font_data.insert("custom".into(), Arc::new(data));
+        family.push("custom".to_string());
+    }
+    family.extend(mono.first().cloned());
+    if let Some((bytes, index)) = find_ui_font("") {
         let mut data = FontData::from_owned(bytes);
         data.index = index;
         fonts.font_data.insert("system-cjk".into(), Arc::new(data));
-        // Proportional: this font first (native look, consistent metrics).
-        fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "system-cjk".into());
-        fonts.families.entry(FontFamily::Monospace).or_default().push("system-cjk".into());
+        family.push("system-cjk".into());
     }
+    family.extend(mono.iter().skip(1).cloned());
+    fonts.font_data.insert("copym-icons".into(), Arc::new(FontData::from_static(ICONS_FONT)));
+    // last fallback, so icons can sit inline in ordinary text
+    family.push("copym-icons".into());
+    fonts.families.insert(FontFamily::Proportional, family.clone());
+    fonts.families.insert(FontFamily::Monospace, family);
+    fonts.families.insert(FontFamily::Name("icons".into()), vec!["copym-icons".into()]);
     add_symbols(&mut fonts);
     ctx.set_fonts(fonts);
+}
+
+/// The `font` setting: a font file (first face of a collection).
+fn custom_font(path: &str) -> Option<(Vec<u8>, u32)> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let path = match path.strip_prefix("~/").zip(dirs::home_dir()) {
+        Some((rest, home)) => home.join(rest),
+        None => path.into(),
+    };
+    FontFile::new(path, None).load()
 }
 
 /// First in every family, so keycaps look the same on every platform (the
@@ -370,14 +418,7 @@ fn face_index(bytes: &[u8], postscript: &str) -> Option<u32> {
 
 fn find_ui_font(custom: &str) -> Option<(Vec<u8>, u32)> {
     let mut candidates: Vec<FontFile> = Vec::new();
-    let custom = custom.trim();
-    if !custom.is_empty() {
-        let path = match custom.strip_prefix("~/").zip(dirs::home_dir()) {
-            Some((rest, home)) => home.join(rest),
-            None => custom.into(),
-        };
-        candidates.push(FontFile::new(path, None));
-    }
+    let _ = custom; // see `custom_font`
     #[cfg(target_os = "linux")]
     if let Ok(out) = std::process::Command::new("fc-match").args(["-f", "%{file}\n%{index}", "sans-serif:lang=zh-cn"]).output() {
         let s = String::from_utf8_lossy(&out.stdout);
@@ -461,55 +502,52 @@ struct Palette {
 }
 
 impl Palette {
-    /// Raycast-like: neutral grays, translucent white/black overlays for
-    /// hover and selection, accent only for small highlights.
+    /// Phosphor terminal: green on near-black (dark), dark green on paper (light).
     fn new(dark: bool) -> Self {
         if dark {
             Self {
-                bg: Color32::from_rgba_unmultiplied(30, 30, 33, 250),
-                surface: Color32::from_rgb(40, 40, 44),
-                hover: Color32::from_rgba_unmultiplied(255, 255, 255, 12),
-                selected: Color32::from_rgba_unmultiplied(255, 255, 255, 24),
-                accent: Color32::from_rgb(255, 99, 99),
-                on_accent: Color32::WHITE,
-                border: Color32::from_rgba_unmultiplied(255, 255, 255, 22),
-                text: Color32::from_rgb(238, 238, 240),
-                dim: Color32::from_rgb(160, 160, 166),
-                faint: Color32::from_rgb(112, 112, 120),
-                danger: Color32::from_rgb(255, 110, 110),
-                ok: Color32::from_rgb(90, 205, 135),
+                bg: Color32::from_rgba_unmultiplied(8, 12, 9, 252),
+                surface: Color32::from_rgb(12, 20, 14),
+                hover: Color32::from_rgba_unmultiplied(51, 255, 102, 12),
+                selected: Color32::from_rgba_unmultiplied(51, 255, 102, 34),
+                accent: Color32::from_rgb(51, 255, 102),
+                on_accent: Color32::from_rgb(6, 12, 8),
+                border: Color32::from_rgba_unmultiplied(51, 255, 102, 70),
+                text: Color32::from_rgb(178, 247, 192),
+                dim: Color32::from_rgb(96, 186, 118),
+                faint: Color32::from_rgb(52, 120, 70),
+                danger: Color32::from_rgb(255, 92, 92),
+                ok: Color32::from_rgb(51, 255, 102),
                 dark,
             }
         } else {
             Self {
-                bg: Color32::from_rgba_unmultiplied(251, 251, 252, 252),
-                surface: Color32::WHITE,
-                hover: Color32::from_rgba_unmultiplied(0, 0, 0, 10),
-                selected: Color32::from_rgba_unmultiplied(0, 0, 0, 20),
-                accent: Color32::from_rgb(232, 64, 64),
-                on_accent: Color32::WHITE,
-                border: Color32::from_rgba_unmultiplied(0, 0, 0, 24),
-                text: Color32::from_rgb(28, 28, 30),
-                dim: Color32::from_rgb(100, 100, 108),
-                faint: Color32::from_rgb(150, 150, 158),
-                danger: Color32::from_rgb(210, 50, 50),
-                ok: Color32::from_rgb(22, 150, 80),
+                bg: Color32::from_rgba_unmultiplied(245, 242, 230, 252),
+                surface: Color32::from_rgb(251, 249, 240),
+                hover: Color32::from_rgba_unmultiplied(0, 110, 45, 14),
+                selected: Color32::from_rgba_unmultiplied(0, 110, 45, 34),
+                accent: Color32::from_rgb(0, 128, 55),
+                on_accent: Color32::from_rgb(251, 249, 240),
+                border: Color32::from_rgba_unmultiplied(0, 100, 40, 80),
+                text: Color32::from_rgb(18, 52, 28),
+                dim: Color32::from_rgb(56, 104, 70),
+                faint: Color32::from_rgb(120, 140, 118),
+                danger: Color32::from_rgb(190, 40, 40),
+                ok: Color32::from_rgb(0, 128, 55),
                 dark,
             }
         }
     }
 
-    /// Accent color of a content type (icon tiles, chips).
+    /// ANSI-like color of a content type tag.
     fn tint(&self, k: TextKind) -> Color32 {
         let (l, d) = match k {
-            TextKind::Url => ((37, 99, 235), (96, 165, 250)),
-            TextKind::Email => ((14, 116, 144), (34, 211, 238)),
-            TextKind::Code => ((5, 150, 105), (52, 211, 153)),
-            TextKind::Json => ((217, 119, 6), (251, 191, 36)),
-            TextKind::Path => ((124, 58, 237), (167, 139, 250)),
-            TextKind::Color => ((219, 39, 119), (244, 114, 182)),
-            TextKind::Image => ((13, 148, 136), (45, 212, 191)),
-            TextKind::Plain => ((100, 100, 112), (160, 161, 175)),
+            TextKind::Url | TextKind::Email => ((0, 120, 150), (80, 220, 240)),
+            TextKind::Code => ((0, 128, 55), (51, 255, 102)),
+            TextKind::Json => ((150, 110, 0), (240, 210, 80)),
+            TextKind::Path | TextKind::Color => ((140, 40, 140), (230, 120, 230)),
+            TextKind::Image => ((40, 80, 170), (120, 170, 255)),
+            TextKind::Plain => ((56, 104, 70), (96, 186, 118)),
         };
         let (r, g, b) = if self.dark { d } else { l };
         Color32::from_rgb(r, g, b)
@@ -541,7 +579,11 @@ struct App {
     groups_error: Option<String>,
     group: usize,
     counts: Vec<Option<u32>>,
+    /// Some counts are lower bounds ("n+").
+    counts_more: bool,
     items: Vec<ItemMeta>,
+    /// Cursor of the next page (`None` = everything loaded).
+    next: Option<u64>,
     selected: usize,
     dirty: bool,
     paused: bool,
@@ -557,7 +599,7 @@ struct App {
     ocr_available: bool,
     sync: Option<SyncInfo>,
     sync_open: bool,
-    ignore: Option<IgnoreDialog>,
+    settings: Option<Settings>,
     sync_polled: Option<Instant>,
     sync_input: String,
     /// (text, is_error)
@@ -565,6 +607,9 @@ struct App {
     /// Code + addresses of the pairing window we opened.
     sync_pairing: Option<(String, Vec<String>)>,
     sync_job: Option<mpsc::Receiver<Result<String, String>>>,
+    /// Newer release (from the daemon's daily check).
+    update: Option<copym_core::model::UpdateInfo>,
+    update_job: Option<mpsc::Receiver<Result<Option<copym_core::model::UpdateInfo>, String>>>,
     editor: Option<Editor>,
     /// Rows of the list (sections + items) with their y offsets.
     lines: Vec<(f32, Line)>,
@@ -579,8 +624,14 @@ struct App {
     /// Local time zone offset in seconds.
     tz: i64,
     frames: u64,
-    /// Keyboard goes to the search box (otherwise to the list).
+    /// Keyboard goes to the search box (Vim INSERT; otherwise NORMAL, the list).
     search_mode: bool,
+    /// `:` command line being typed (Vim COMMAND mode).
+    cmdline: Option<String>,
+    /// Count / operator typed so far in NORMAL mode ("12", "g", "3d" …).
+    pending: String,
+    /// Key help (`?`).
+    help: bool,
     /// Set by the popup host when the hotkey asks the window to close.
     close_req: Arc<AtomicBool>,
     after: Arc<Mutex<AfterClose>>,
@@ -590,9 +641,9 @@ struct App {
     hidden: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Line {
-    Section(&'static str),
+    Section(String),
     Item(usize),
 }
 
@@ -601,6 +652,7 @@ enum Act {
     Paste,
     Copy,
     Pin,
+    PinTo(u32),
     OpenUrl(String),
     OpenPath(String),
     Delete,
@@ -609,22 +661,17 @@ enum Act {
     Groups,
     /// Stop recording copies from this app.
     IgnoreApp(String),
-    IgnoredApps,
-    Autostart,
+    Theme,
+    CheckUpdate,
+    OpenUpdate(String),
     Settings,
     Quit,
 }
 
 enum PanelRow {
     Title(String),
-    Act(Act, String, String),
-}
-
-/// State of the "ignored apps" dialog.
-#[derive(Default)]
-struct IgnoreDialog {
-    input: String,
-    msg: Option<(String, bool)>,
+    /// action, icon, label, key hint
+    Act(Act, &'static str, String, String),
 }
 
 /// State of the "manage groups" dialog.
@@ -680,7 +727,10 @@ enum Action {
     /// (index, paste into the previous window)
     Activate(usize, bool),
     Delete(usize),
+    /// Pin into the first pin group, or unpin.
     Pin(usize),
+    /// Put into pin group n (again = unpin; 0 = unpin).
+    PinTo(usize, u32),
 }
 
 impl App {
@@ -697,6 +747,8 @@ impl App {
             groups_error,
             group,
             counts: Vec::new(),
+            counts_more: false,
+            next: None,
             items: Vec::new(),
             selected: 0,
             dirty: true,
@@ -713,12 +765,14 @@ impl App {
             ocr_available: false,
             sync: None,
             sync_open: false,
-            ignore: None,
+            settings: None,
             sync_polled: None,
             sync_input: String::new(),
             sync_msg: None,
             sync_pairing: None,
             sync_job: None,
+            update: None,
+            update_job: None,
             editor: None,
             lines: Vec::new(),
             item_y: Vec::new(),
@@ -729,6 +783,9 @@ impl App {
             tz: local_offset(),
             frames: 0,
             search_mode: false,
+            cmdline: None,
+            pending: String::new(),
+            help: false,
             close_req,
             after,
             resident: None,
@@ -741,6 +798,9 @@ impl App {
             app.ocr_available = ocr.is_some();
         }
         app.refresh_sync();
+        if let Some(Response::Update(u)) = app.req(&Request::CheckUpdate { now: false }) {
+            app.update = u;
+        }
         app
     }
 
@@ -750,7 +810,7 @@ impl App {
                 self.client = Some(c);
                 self.error = None;
             }
-            Err(e) => self.error = Some(format!("无法连接 copym 守护进程：{e}")),
+            Err(e) => self.error = Some(tf!("无法连接 copym 守护进程：{e}", "cannot connect to the copym daemon: {e}")),
         }
     }
 
@@ -767,7 +827,7 @@ impl App {
             Ok(resp) => Some(resp),
             Err(e) => {
                 self.client = None;
-                self.error = Some(format!("守护进程连接中断：{e}"));
+                self.error = Some(tf!("守护进程连接中断：{e}", "lost the connection to the daemon: {e}"));
                 None
             }
         }
@@ -781,11 +841,13 @@ impl App {
         self.dirty = false;
         let rule = self.groups.rule(self.group);
         let group = (rule != GroupRule::default()).then_some(rule);
-        let req = Request::ListGroup { query: self.query.clone(), regex: self.regex, group, limit: LIST_LIMIT };
+        let req = Request::ListGroup { query: self.query.clone(), regex: self.regex, group, before: None, limit: PAGE };
         self.search_error = None;
+        self.next = None;
         match self.req(&req) {
-            Some(Response::Items(items)) => {
+            Some(Response::Page { items, next }) => {
                 self.items = items;
+                self.next = next;
                 self.selected = self.selected.min(self.items.len().saturating_sub(1));
                 self.scroll_to_selected = true;
                 self.layout_list();
@@ -799,7 +861,10 @@ impl App {
         }
         let counts = Request::GroupCounts { query: self.query.clone(), regex: self.regex, groups: self.groups.rules() };
         match self.req(&counts) {
-            Some(Response::Counts(c)) => self.counts = c,
+            Some(Response::GroupCounts { counts, more }) => {
+                self.counts = counts;
+                self.counts_more = more;
+            }
             _ => {
                 self.counts.clear();
                 if self.client.is_some() {
@@ -809,26 +874,56 @@ impl App {
         }
     }
 
+    /// Load the next page when the list is short (a search still streaming
+    /// in) or the cursor / scroll position nears the end.
+    fn load_more(&mut self, ctx: &egui::Context) {
+        let Some(before) = self.next else { return };
+        let near_end = self.selected + 50 >= self.items.len()
+            || (self.view_height > 0.0 && self.scroll_offset + self.view_height * 2.0 >= self.list_height);
+        if self.items.len() >= PAGE as usize && !near_end {
+            return;
+        }
+        let rule = self.groups.rule(self.group);
+        let group = (rule != GroupRule::default()).then_some(rule);
+        let req = Request::ListGroup { query: self.query.clone(), regex: self.regex, group, before: Some(before), limit: PAGE };
+        match self.req(&req) {
+            Some(Response::Page { items, next }) => {
+                let known: std::collections::HashSet<u64> = self.items.iter().map(|m| m.id).collect();
+                self.items.extend(items.into_iter().filter(|m| !known.contains(&m.id)));
+                self.next = next;
+                self.layout_list();
+                ctx.request_repaint();
+            }
+            _ => self.next = None,
+        }
+    }
+
     /// Split the list into sections: pinned, today, yesterday, this week, older.
     fn layout_list(&mut self) {
         let today = (now_secs() + self.tz).div_euclid(86_400);
         let mut lines = Vec::with_capacity(self.items.len() + 5);
         let mut item_y = Vec::with_capacity(self.items.len());
         let mut y = 4.0;
-        let mut last = "";
+        let mut last = String::new();
+        let several = self.groups.boards().nth(1).is_some();
         for (i, m) in self.items.iter().enumerate() {
-            let sec = if m.pinned {
-                "已固定"
+            let sec: String = if m.pinned {
+                // one section per pin group when there are several
+                match self.groups.board_name(m.board).filter(|_| several) {
+                    Some(name) => name.to_string(),
+                    None => t!("已固定", "pinned").into(),
+                }
             } else {
                 match today - (m.created + self.tz).div_euclid(86_400) {
-                    ..=0 => "今天",
-                    1 => "昨天",
-                    2..=6 => "本周",
-                    _ => "更早",
+                    ..=0 => t!("今天", "today"),
+                    1 => t!("昨天", "yesterday"),
+                    2..=6 => t!("本周", "this week"),
+                    _ => t!("更早", "older"),
                 }
+                .into()
             };
             if sec != last {
-                lines.push((y, Line::Section(sec)));
+                lines.push((y, Line::Section(sec.clone())));
                 y += SECTION_H;
                 last = sec;
             }
@@ -913,8 +1008,20 @@ impl App {
                 }
             }
             Action::Pin(i) => {
-                if let Some(id) = self.items.get(i).map(|m| m.id) {
-                    self.req(&Request::TogglePin { id });
+                if let Some(m) = self.items.get(i) {
+                    let board = if m.pinned { 0 } else { self.groups.first_board() };
+                    self.perform(ctx, Action::PinTo(i, board));
+                }
+            }
+            Action::PinTo(i, board) => {
+                if let Some((id, current)) = self.items.get(i).map(|m| (m.id, m.board)) {
+                    let board = if board == current { 0 } else { board };
+                    if let Some(Response::Ok) = self.req(&Request::SetPin { id, board }) {
+                        match self.groups.board_name(board) {
+                            Some(name) => self.notify(tf!("已放进「{name}」", "put into “{name}”")),
+                            None => self.notify(t!("已取消固定", "unpinned")),
+                        }
+                    }
                     self.dirty = true;
                 }
             }
@@ -930,169 +1037,6 @@ impl App {
         self.scroll_to_selected = true;
     }
 
-    fn handle_keys(&mut self, ctx: &egui::Context) -> Option<Action> {
-        if self.sync_open || self.editor.is_some() || self.ignore.is_some() {
-            return None; // dialogs own the keyboard
-        }
-        if self.actions.is_some() {
-            return self.panel_keys(ctx);
-        }
-        let mut action = None;
-        let mut close = false;
-        let mut nav = 0isize;
-        let mut cycle = 0isize;
-        let mut group = None;
-        let mut toggle_regex = false;
-        let mut open_actions = false;
-        let mut search = false;
-        let mut quit = false;
-        let list_mode = !self.search_mode;
-        let page = ((self.view_height / ROW_H).floor() as isize).max(1);
-        let last = self.items.len() as isize;
-        let paste = self.cfg.paste_on_enter;
-        ctx.input_mut(|i| {
-            // Action panel: ⌘K on macOS, Alt+K elsewhere (Ctrl+K is Vim "up").
-            #[cfg(target_os = "macos")]
-            let actions_key = i.consume_key(Modifiers::COMMAND, Key::K);
-            #[cfg(not(target_os = "macos"))]
-            let actions_key = i.consume_key(Modifiers::ALT, Key::K);
-            if actions_key {
-                open_actions = true;
-                i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
-            }
-            if i.consume_key(Modifiers::COMMAND, Key::Q) {
-                quit = true;
-            }
-            // Down / up: arrows, Vim (Ctrl+J / Ctrl+K) and Emacs (Ctrl+N / Ctrl+P).
-            // Plain Ctrl - on macOS ⌘ stays free for the app's own shortcuts.
-            for k in [Key::ArrowDown, Key::J, Key::N] {
-                let m = if k == Key::ArrowDown { Modifiers::NONE } else { Modifiers::CTRL };
-                if i.consume_key(m, k) {
-                    nav = 1;
-                }
-            }
-            for k in [Key::ArrowUp, Key::K, Key::P] {
-                let m = if k == Key::ArrowUp { Modifiers::NONE } else { Modifiers::CTRL };
-                if i.consume_key(m, k) {
-                    nav = -1;
-                }
-            }
-            if i.consume_key(Modifiers::NONE, Key::PageDown) {
-                nav = page;
-            }
-            if i.consume_key(Modifiers::NONE, Key::PageUp) {
-                nav = -page;
-            }
-            // Shift+Enter first: matching ignores extra Shift.
-            if i.consume_key(Modifiers::SHIFT, Key::Enter) {
-                action = Some(Action::Activate(self.selected, !paste));
-            }
-            if i.consume_key(Modifiers::NONE, Key::Enter) {
-                action = Some(Action::Activate(self.selected, paste));
-            }
-            if i.consume_key(Modifiers::COMMAND, Key::S) {
-                action = Some(Action::Pin(self.selected));
-            }
-            if i.consume_key(Modifiers::SHIFT, Key::Delete) || i.consume_key(Modifiers::COMMAND, Key::D) {
-                action = Some(Action::Delete(self.selected));
-            }
-            if i.consume_key(Modifiers::SHIFT, Key::Tab) {
-                cycle = -1;
-            }
-            if i.consume_key(Modifiers::NONE, Key::Tab) {
-                cycle = 1;
-            }
-            if i.consume_key(Modifiers::COMMAND, Key::R) || i.consume_key(Modifiers::ALT, Key::R) {
-                toggle_regex = true;
-            }
-            if i.consume_key(Modifiers::COMMAND, Key::F) {
-                search = true;
-            }
-            let digits = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
-            let mut swallow_text = false;
-            for (n, k) in digits.iter().enumerate() {
-                if i.consume_key(Modifiers::COMMAND, *k) {
-                    group = Some(n);
-                }
-                if i.consume_key(Modifiers::ALT, *k) || (list_mode && i.consume_key(Modifiers::NONE, *k)) {
-                    action = Some(Action::Activate(n, paste));
-                    swallow_text = true;
-                }
-            }
-            if list_mode {
-                // Vim-style keys while the list has the keyboard.
-                if i.consume_key(Modifiers::NONE, Key::J) {
-                    nav = 1;
-                }
-                if i.consume_key(Modifiers::NONE, Key::K) {
-                    nav = -1;
-                }
-                if i.consume_key(Modifiers::NONE, Key::End) || i.consume_key(Modifiers::SHIFT, Key::G) {
-                    nav = last;
-                }
-                if i.consume_key(Modifiers::NONE, Key::Home) || i.consume_key(Modifiers::NONE, Key::G) {
-                    nav = -last;
-                }
-                if i.consume_key(Modifiers::NONE, Key::Slash) || i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "/")) {
-                    search = true;
-                }
-                // Nothing is typed into the search box until it is focused.
-                swallow_text = true;
-            }
-            if swallow_text {
-                // ⌥1 also types "¡" on macOS - keep it out of the search box.
-                i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
-            }
-            if i.consume_key(Modifiers::NONE, Key::Escape) {
-                close = true;
-            }
-        });
-        if quit {
-            self.quit(ctx);
-            return None;
-        }
-        if open_actions {
-            self.actions = Some(0);
-        }
-        if nav != 0 {
-            self.move_selection(nav);
-        }
-        if toggle_regex {
-            self.regex = !self.regex;
-            self.dirty = true;
-        }
-        if let Some(g) = group {
-            self.set_group(g);
-        }
-        if cycle != 0 && !self.groups.list.is_empty() {
-            let n = self.groups.list.len() as isize;
-            self.set_group(((self.group as isize + cycle).rem_euclid(n)) as usize);
-        }
-        if search {
-            self.search_mode = true;
-        }
-        if close {
-            if self.search_mode {
-                // Esc leaves the search box (and clears it); a second Esc closes.
-                if !self.query.is_empty() {
-                    self.query.clear();
-                    self.dirty = true;
-                }
-                if self.cfg.popup_focus == "search" && self.query.is_empty() && !self.dirty {
-                    self.close(ctx);
-                } else {
-                    self.search_mode = false;
-                    ctx.memory_mut(|m| m.surrender_focus(egui::Id::unique("search")));
-                }
-            } else if !self.query.is_empty() {
-                self.query.clear();
-                self.dirty = true;
-            } else {
-                self.close(ctx);
-            }
-        }
-        action
-    }
 
     /// Close the popup: end the window, or (resident mode) hide the app, which
     /// gives the focus back to the previous app, and paste in the background.
@@ -1111,7 +1055,7 @@ impl App {
         let notice = r.notice.clone();
         std::thread::spawn(move || {
             if let Some(e) = paste_after(&after) {
-                *notice.lock().unwrap() = Some(format!("自动粘贴失败：{e}（内容已在剪贴板）"));
+                *notice.lock().unwrap() = Some(tf!("自动粘贴失败：{e}（内容已在剪贴板）", "auto paste failed: {e} (the content is on the clipboard)"));
             }
         });
     }
@@ -1138,43 +1082,66 @@ impl App {
     }
 
     /// Rows of the action panel for the selected item.
+    /// Rows of the action menu. The key column is the row's letter: pressing
+    /// it runs the row (which-key style); j/k/⏎ work too.
     fn panel_rows(&self) -> Vec<PanelRow> {
+        use crate::icons as ic;
         let mut rows = Vec::new();
-        let cmd = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" };
-        let enter = if cfg!(target_os = "macos") { "⏎" } else { "Enter" };
+        let act = |a: Act, glyph: &'static str, label: String, key: &str| PanelRow::Act(a, glyph, label, key.to_string());
         if let Some(m) = self.items.get(self.selected) {
             let title = match m.kind {
                 Kind::Text => one_line(&m.preview),
-                Kind::Image => format!("图片 {}×{}", m.width, m.height),
+                Kind::Image => tf!("图片 {}×{}", "image {}×{}", m.width, m.height),
             };
             rows.push(PanelRow::Title(title));
-            let shift_enter = if cfg!(target_os = "macos") { "⇧⏎" } else { "Shift+Enter" };
-            let (paste_key, copy_key) = if self.cfg.paste_on_enter { (enter, shift_enter) } else { (shift_enter, enter) };
-            rows.push(PanelRow::Act(Act::Paste, "粘贴到当前窗口".into(), paste_key.into()));
-            rows.push(PanelRow::Act(Act::Copy, "复制到剪贴板".into(), copy_key.into()));
+            rows.push(act(Act::Paste, ic::CLIPBOARD_PASTE, t!("粘贴到当前窗口", "paste to the active window").into(), "p"));
+            rows.push(act(Act::Copy, ic::COPY, t!("复制到剪贴板", "yank to clipboard").into(), "y"));
             if let Some((id, Detail::Text { kind, body })) = &self.detail {
                 if *id == m.id {
                     match kind {
-                        TextKind::Url => rows.push(PanelRow::Act(Act::OpenUrl(body.trim().into()), "在浏览器中打开".into(), String::new())),
-                        TextKind::Path => rows.push(PanelRow::Act(Act::OpenPath(body.trim().into()), "在文件管理器中打开".into(), String::new())),
+                        TextKind::Url => rows.push(act(Act::OpenUrl(body.trim().into()), ic::EXTERNAL_LINK, t!("在浏览器中打开", "open in browser").into(), "o")),
+                        TextKind::Path => rows.push(act(Act::OpenPath(body.trim().into()), ic::FOLDER_OPEN, t!("在文件管理器中打开", "show in file manager").into(), "o")),
                         _ => {}
                     }
                 }
             }
-            rows.push(PanelRow::Act(Act::Pin, if m.pinned { "取消固定" } else { "固定" }.into(), format!("{cmd}S")));
-            rows.push(PanelRow::Act(Act::Delete, "删除".into(), format!("{cmd}D")));
+            let boards: Vec<(u32, String, String)> = self.groups.boards().map(|(_, g)| (g.board, g.name.clone(), g.key.clone())).collect();
+            if boards.len() <= 1 {
+                let (pin_icon, pin_label) = if m.pinned { (ic::PIN_OFF, t!("取消固定", "unpin")) } else { (ic::PIN, t!("固定", "pin")) };
+                rows.push(act(Act::Pin, pin_icon, pin_label.into(), "m"));
+            } else {
+                if m.pinned {
+                    let from = self.groups.board_name(m.board).unwrap_or("").to_string();
+                    rows.push(act(Act::PinTo(0), ic::PIN_OFF, tf!("取消固定（从「{from}」）", "unpin (from “{from}”)"), "m"));
+                }
+                // one row per other pin group; the key column shows the NORMAL-mode command
+                for (b, name, key) in boards.into_iter().filter(|(b, _, _)| *b != m.board) {
+                    let hint = if key.is_empty() { String::new() } else { format!("m{key}") };
+                    rows.push(act(Act::PinTo(b), ic::PIN, tf!("放进「{name}」", "put into “{name}”"), &hint));
+                }
+            }
+            rows.push(act(Act::Delete, ic::TRASH_2, t!("删除", "delete").into(), "d"));
             if let Some(app) = m.source.as_deref().filter(|a| self.is_local_app(a)) {
-                rows.push(PanelRow::Act(Act::IgnoreApp(app.to_string()), format!("不再记录「{app}」的复制"), String::new()));
+                rows.push(act(Act::IgnoreApp(app.to_string()), ic::BAN, tf!("不再记录「{app}」的复制", "stop recording “{app}”"), "b"));
             }
         }
         rows.push(PanelRow::Title("copym".into()));
-        rows.push(PanelRow::Act(Act::Pause, if self.paused { "继续记录剪贴板" } else { "暂停记录剪贴板" }.into(), String::new()));
-        rows.push(PanelRow::Act(Act::Sync, "局域网同步…".into(), String::new()));
-        rows.push(PanelRow::Act(Act::Groups, "管理分组…".into(), String::new()));
-        rows.push(PanelRow::Act(Act::IgnoredApps, "不记录的应用…".into(), String::new()));
-        rows.push(PanelRow::Act(Act::Autostart, if self.autostart { "关闭登录时自动启动" } else { "登录时自动启动" }.into(), String::new()));
-        rows.push(PanelRow::Act(Act::Settings, "打开设置文件".into(), String::new()));
-        rows.push(PanelRow::Act(Act::Quit, "退出 copym".into(), format!("{cmd}Q")));
+        let (pause_icon, pause_label) = if self.paused { (ic::PLAY, t!("继续记录剪贴板", "resume recording")) } else { (ic::PAUSE, t!("暂停记录剪贴板", "pause recording")) };
+        rows.push(act(Act::Pause, pause_icon, pause_label.into(), "r"));
+        let (theme_icon, theme_label) = match self.cfg.theme.as_str() {
+            "light" => (ic::SUN, t!("外观：浅色", "appearance: light")),
+            "dark" => (ic::MOON, t!("外观：深色", "appearance: dark")),
+            _ => (ic::SUN_MOON, t!("外观：跟随系统", "appearance: system")),
+        };
+        rows.push(act(Act::Theme, theme_icon, theme_label.into(), "t"));
+        rows.push(act(Act::Sync, ic::WIFI, t!("局域网同步…", "LAN sync…").into(), "s"));
+        rows.push(act(Act::Groups, ic::LAYERS, t!("管理分组…", "manage groups…").into(), "g"));
+        rows.push(act(Act::Settings, ic::SETTINGS, t!("设置…", "settings…").into(), ","));
+        match &self.update {
+            Some(u) => rows.push(act(Act::OpenUpdate(u.url.clone()), ic::DOWNLOAD, tf!("下载新版本 {}", "download version {}", u.version), "u")),
+            None => rows.push(act(Act::CheckUpdate, ic::REFRESH_CW, tf!("检查更新（v{}）", "check for updates (v{})", env!("CARGO_PKG_VERSION")), "u")),
+        }
+        rows.push(act(Act::Quit, ic::LOG_OUT, t!("退出 copym", "quit copym").into(), "Q"));
         rows
     }
 
@@ -1183,9 +1150,11 @@ impl App {
     }
 
     fn panel_keys(&mut self, ctx: &egui::Context) -> Option<Action> {
-        let n = self.panel_acts().len();
+        let rows = self.panel_rows();
+        let keys: Vec<String> = rows.iter().filter_map(|r| if let PanelRow::Act(_, _, _, k) = r { Some(k.clone()) } else { None }).collect();
+        let n = keys.len();
         let mut sel = self.actions.unwrap_or(0);
-        let mut run = false;
+        let mut run = None;
         let mut close = false;
         ctx.input_mut(|i| {
             for (k, m, d) in [
@@ -1201,14 +1170,31 @@ impl App {
                 }
             }
             if i.consume_key(Modifiers::NONE, Key::Enter) {
-                run = true;
+                run = Some(sel);
             }
             #[cfg(target_os = "macos")]
-            let toggle = i.consume_key(Modifiers::COMMAND, Key::K);
+            let toggle = i.consume_key(Modifiers::MAC_CMD, Key::K);
             #[cfg(not(target_os = "macos"))]
             let toggle = i.consume_key(Modifiers::ALT, Key::K);
             if toggle || i.consume_key(Modifiers::NONE, Key::Escape) {
                 close = true;
+            }
+            for e in &i.events {
+                let egui::Event::Text(t) = e else { continue };
+                for c in t.chars() {
+                    match c {
+                        'j' => sel = (sel + 1) % n.max(1),
+                        'k' => sel = (sel + n.max(1) - 1) % n.max(1),
+                        'l' => run = Some(sel),
+                        'h' | 'q' | ' ' => close = true,
+                        'G' => sel = n.saturating_sub(1),
+                        _ => {
+                            if let Some(pos) = keys.iter().position(|k| k.chars().eq(std::iter::once(c))) {
+                                run = Some(pos);
+                            }
+                        }
+                    }
+                }
             }
             i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
         });
@@ -1216,8 +1202,8 @@ impl App {
         if close {
             self.actions = None;
         }
-        if run {
-            let act = self.panel_acts().get(sel).cloned();
+        if let Some(r) = run {
+            let act = self.panel_acts().get(r).cloned();
             self.actions = None;
             return act.and_then(|a| self.run_act(ctx, a));
         }
@@ -1230,6 +1216,11 @@ impl App {
             Act::Copy => return Some(Action::Activate(self.selected, false)),
             Act::Quit => self.pending_quit = true,
             Act::Pin => return Some(Action::Pin(self.selected)),
+            Act::PinTo(0) => {
+                let current = self.items.get(self.selected).map(|m| m.board).unwrap_or(0);
+                return Some(Action::PinTo(self.selected, current));
+            }
+            Act::PinTo(b) => return Some(Action::PinTo(self.selected, b)),
             Act::Delete => return Some(Action::Delete(self.selected)),
             Act::OpenUrl(u) => open_external(&u),
             Act::OpenPath(p) => {
@@ -1237,13 +1228,13 @@ impl App {
                 let dir = if path.is_dir() { Some(path) } else { path.parent().filter(|d| d.is_dir()) };
                 match dir {
                     Some(d) => open_external(&d.to_string_lossy()),
-                    None => self.notify("本机上不存在这个路径"),
+                    None => self.notify(t!("本机上不存在这个路径", "this path does not exist here")),
                 }
             }
             Act::Pause => {
                 if let Some(Response::Status { paused, .. }) = self.req(&Request::SetPaused(None)) {
                     self.paused = paused;
-                    self.notify(if paused { "已暂停记录" } else { "继续记录" });
+                    self.notify(if paused { t!("已暂停记录", "recording paused") } else { t!("继续记录", "recording resumed") });
                 }
             }
             Act::Sync => {
@@ -1256,21 +1247,37 @@ impl App {
                 let mut apps = self.cfg.ignore_apps.clone();
                 apps.push(app.clone());
                 if self.set_ignored(apps) {
-                    self.notify(format!("不再记录「{app}」的复制（可在“不记录的应用…”里恢复）"));
+                    self.notify(tf!("不再记录「{app}」的复制（可在“不记录的应用…”里恢复）", "no longer recording “{app}” (undo in settings › privacy)"));
                 } else {
                     let e = self.error.take().unwrap_or_default();
-                    self.notify(format!("设置失败：{e}"));
+                    self.notify(tf!("设置失败：{e}", "failed: {e}"));
                 }
             }
-            Act::IgnoredApps => self.ignore = Some(IgnoreDialog::default()),
-            Act::Autostart => match crate::autostart::set(!self.autostart) {
-                Ok(_) => {
-                    self.autostart = !self.autostart;
-                    self.notify(if self.autostart { "已设为登录时自动启动" } else { "已关闭登录时自动启动" });
+            Act::Theme => {
+                let next = match self.cfg.theme.as_str() {
+                    "system" | "" => "light",
+                    "light" => "dark",
+                    _ => "system",
+                };
+                self.save_theme(next);
+            }
+            Act::OpenUpdate(url) => open_external(&url),
+            Act::CheckUpdate => {
+                if self.update_job.is_none() {
+                    let (tx, rx) = mpsc::channel();
+                    self.update_job = Some(rx);
+                    std::thread::spawn(move || {
+                        let res = Client::connect().map_err(|e| e.to_string()).and_then(|mut c| c.request(&Request::CheckUpdate { now: true }).map_err(|e| e.to_string())).and_then(|r| match r {
+                            Response::Update(u) => Ok(u),
+                            Response::Err(e) => Err(e),
+                            _ => Err("unexpected response".into()),
+                        });
+                        let _ = tx.send(res);
+                    });
+                    self.notify(t!("正在检查更新…", "checking for updates…"));
                 }
-                Err(e) => self.notify(format!("设置失败：{e}")),
-            },
-            Act::Settings => open_external(&crate::config::config_path().to_string_lossy()),
+            }
+            Act::Settings => self.open_settings(),
         }
         None
     }
@@ -1291,19 +1298,23 @@ impl App {
                     egui::Button::new(RichText::new(".*").monospace().size(12.5).color(if on { pal.text } else { pal.faint }))
                         .fill(if on { pal.selected } else { Color32::TRANSPARENT })
                         .stroke(Stroke::NONE)
-                        .corner_radius(6)
+                        .corner_radius(2)
                         .min_size(Vec2::new(30.0, 26.0)),
                 )
-                .on_hover_text(format!("正则表达式搜索 ({KEY_GROUP}R)"));
+                .on_hover_text(t!("正则表达式搜索（:set regex）", "regular expressions (:set regex)"));
             if b.clicked() {
                 self.regex = !self.regex;
                 self.dirty = true;
             }
-            let hint = if self.regex { "正则，例如 \\d{6} 或 ^https?://" } else { "搜索剪贴板历史…" };
+            let hint = match (self.search_mode, self.regex) {
+                (_, true) => t!("正则，例如 \\d{6} 或 ^https?://", "regex, e.g. \\d{6} or ^https?://"),
+                (true, false) => t!("搜索剪贴板历史…", "search clipboard history…"),
+                (false, false) => t!("按 / 搜索，? 查看按键", "/ to search, ? for keys"),
+            };
             let edit = egui::TextEdit::singleline(&mut self.query)
                 .hint_text(RichText::new(hint).color(pal.faint))
                 .desired_width(ui.available_width())
-                .font(FontId::proportional(17.0))
+                .font(FontId::proportional(15.0))
                 .text_color(pal.text)
                 .frame(egui::Frame::NONE)
                 .margin(Margin::symmetric(0, 4));
@@ -1315,16 +1326,21 @@ impl App {
             if r.has_focus() || r.clicked() {
                 self.search_mode = true;
             }
-            if self.search_mode && !self.sync_open && self.editor.is_none() && self.ignore.is_none() && self.actions.is_none() {
+            if self.search_mode && !self.sync_open && self.editor.is_none() && self.settings.is_none() && self.actions.is_none() {
                 r.request_focus();
             }
         });
-        // magnifier
-        let c = Pos2::new(rect.left() + 24.0, rect.center().y - 1.0);
+        // shell prompt
         let p = ui.painter();
-        let color = if self.search_error.is_some() { pal.danger } else { pal.faint };
-        p.circle_stroke(c, 6.0, Stroke::new(1.7, color));
-        p.line_segment([c + Vec2::new(4.4, 4.4), c + Vec2::new(8.5, 8.5)], Stroke::new(1.9, color));
+        let color = if self.search_error.is_some() {
+            pal.danger
+        } else if self.search_mode {
+            pal.accent
+        } else {
+            pal.dim
+        };
+        let prompt = if self.regex { "~/" } else { ">" };
+        p.text(Pos2::new(rect.left() + 18.0, rect.center().y), Align2::LEFT_CENTER, prompt, FontId::proportional(16.0), color);
         p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, pal.border));
     }
 
@@ -1345,10 +1361,10 @@ impl App {
                 egui::Button::new(RichText::new(format!("{name}    ")).size(13.0).color(pal.dim))
                     .fill(Color32::TRANSPARENT)
                     .stroke(Stroke::new(1.0, pal.border))
-                    .corner_radius(7)
+                    .corner_radius(2)
                     .min_size(Vec2::new(0.0, 28.0)),
             )
-            .on_hover_text(format!("{full}\n分组（{KEY_GROUP}1…9 / Tab 切换）"));
+            .on_hover_text(tf!("{full}\n分组（{KEY_GROUP}1…9 / Tab 切换）", "{full}\ngroup (gt / gT / Tab, {KEY_GROUP}1…9)"));
         // chevron
         let r = resp.rect;
         let c = Pos2::new(r.right() - 14.0, r.center().y);
@@ -1366,11 +1382,12 @@ impl App {
                 let fill = if i == self.group { pal.selected } else if hover.hovered() { pal.hover } else { Color32::TRANSPARENT };
                 let p = ui.painter();
                 p.rect_filled(row, 6, fill);
-                let label = if self.groups.default == g.name { format!("{}  · 默认", g.name) } else { g.name.clone() };
+                let label = if self.groups.default == g.name { tf!("{}  · 默认", "{}  · default", g.name) } else { g.name.clone() };
                 p.text(row.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(13.0), pal.text);
                 let mut right = match self.counts.get(i) {
+                    Some(Some(n)) if self.counts_more && i > 0 => format!("{n}+"),
                     Some(Some(n)) => n.to_string(),
-                    Some(None) => "规则无效".into(),
+                    Some(None) => t!("规则无效", "invalid rule").into(),
                     None => String::new(),
                 };
                 if i < 9 {
@@ -1392,8 +1409,8 @@ impl App {
             if hover.hovered() {
                 ui.painter().rect_filled(row, 6, pal.hover);
             }
-            ui.painter().text(row.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, "管理分组…", FontId::proportional(13.0), pal.text);
-            ui.painter().text(row.right_center() - Vec2::new(10.0, 0.0), Align2::RIGHT_CENTER, "右键：设为默认", FontId::proportional(11.0), pal.faint);
+            ui.painter().text(row.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, t!("管理分组…", "manage groups…"), FontId::proportional(13.0), pal.text);
+            ui.painter().text(row.right_center() - Vec2::new(10.0, 0.0), Align2::RIGHT_CENTER, t!("右键：设为默认", "right click: make default"), FontId::proportional(11.0), pal.faint);
             if hover.clicked() {
                 manage = true;
                 ui.close();
@@ -1408,8 +1425,8 @@ impl App {
         if let Some(i) = make_default {
             self.groups.default = self.groups.list[i].name.clone();
             match groups::save(&self.groups) {
-                Ok(()) => self.notify(format!("打开时将默认显示「{}」", self.groups.default)),
-                Err(e) => self.notify(format!("保存失败：{e}")),
+                Ok(()) => self.notify(tf!("打开时将默认显示「{}」", "“{}” now opens by default", self.groups.default)),
+                Err(e) => self.notify(tf!("保存失败：{e}", "save failed: {e}")),
             }
         }
     }
@@ -1427,11 +1444,11 @@ impl App {
         if self.items.is_empty() {
             ui.centered_and_justified(|ui| {
                 let msg = if !self.query.is_empty() {
-                    "没有匹配的条目"
+                    t!("没有匹配的条目", "no matches")
                 } else if self.group == 0 {
-                    "剪贴板历史为空\n复制点什么试试吧"
+                    t!("剪贴板历史为空\n复制点什么试试吧", "clipboard history is empty\ncopy something")
                 } else {
-                    "这个分组里还没有内容"
+                    t!("这个分组里还没有内容", "nothing in this group yet")
                 };
                 ui.label(RichText::new(msg).color(pal.faint).size(13.5));
             });
@@ -1466,17 +1483,16 @@ impl App {
                 let rect = Rect::from_min_size(origin + Vec2::new(0.0, y), Vec2::new(width, h));
                 match line {
                     Line::Section(name) => {
-                        ui.painter().text(
-                            Pos2::new(rect.left() + 14.0, rect.bottom() - 9.0),
-                            Align2::LEFT_BOTTOM,
-                            name,
-                            FontId::proportional(11.5),
-                            pal.faint,
-                        );
+                        let y = rect.bottom() - 15.0;
+                        let p = ui.painter();
+                        let label = p.text(Pos2::new(rect.left() + 30.0, y), Align2::LEFT_CENTER, name, FontId::proportional(11.5), pal.faint);
+                        let stroke = Stroke::new(1.0, pal.border.gamma_multiply(0.6));
+                        p.hline(rect.left() + 12.0..=label.left() - 6.0, y, stroke);
+                        p.hline(label.right() + 6.0..=rect.right() - 12.0, y, stroke);
                     }
                     Line::Item(i) => {
                         let meta = self.items[i].clone();
-                        let row = rect.shrink2(Vec2::new(6.0, 1.0));
+                        let row = rect.shrink2(Vec2::new(4.0, 0.0));
                         let resp = ui.interact(row, egui::Id::unique(("row", meta.id)), Sense::click());
                         let selected = i == self.selected;
                         let fill = if selected {
@@ -1486,9 +1502,23 @@ impl App {
                         } else {
                             Color32::TRANSPARENT
                         };
-                        ui.painter().rect_filled(row, 8, fill);
+                        ui.painter().rect_filled(row, 0, fill);
+                        if selected {
+                            // cursor bar, like a selected line in a terminal UI
+                            let bar = Rect::from_min_size(row.min, Vec2::new(3.0, row.height()));
+                            ui.painter().rect_filled(bar, 0, pal.accent);
+                        }
                         let kind = if meta.kind == Kind::Image { TextKind::Image } else { classify(&meta.preview, false) };
-                        let tile = Rect::from_center_size(Pos2::new(row.left() + 20.0, row.center().y), Vec2::splat(22.0));
+                        // line number (relative to the cursor, like `set relativenumber`, absolute on the cursor line)
+                        let num = if selected { format!("{}", i + 1) } else { format!("{}", (i as isize - self.selected as isize).unsigned_abs()) };
+                        ui.painter().text(
+                            Pos2::new(row.left() + 34.0, row.center().y),
+                            Align2::RIGHT_CENTER,
+                            num,
+                            FontId::proportional(11.5),
+                            if selected { pal.accent } else { pal.faint },
+                        );
+                        let tile = Rect::from_min_size(Pos2::new(row.left() + 42.0, row.center().y - 9.0), Vec2::new(36.0, 18.0));
                         self.paint_tile(ui, &ctx, pal, tile, &meta, kind);
 
                         // accessories on the right: pinned dot + time
@@ -1502,8 +1532,18 @@ impl App {
                         );
                         let mut right = time.left() - 10.0;
                         if meta.pinned {
-                            painter.circle_filled(Pos2::new(right - 2.0, row.center().y), 3.0, pal.accent);
-                            right -= 12.0;
+                            let key = self.groups.boards().nth(1).and(self.groups.boards().find(|(_, g)| g.board == meta.board)).map(|(_, g)| g.key.clone()).filter(|k| !k.is_empty());
+                            match key {
+                                // several pin groups: show which one (its key, like a Vim mark)
+                                Some(k) => {
+                                    let r = painter.text(Pos2::new(right, row.center().y), Align2::RIGHT_CENTER, format!("'{k}"), FontId::monospace(11.5), pal.accent);
+                                    right = r.left() - 8.0;
+                                }
+                                None => {
+                                    painter.circle_filled(Pos2::new(right - 2.0, row.center().y), 3.0, pal.accent);
+                                    right -= 12.0;
+                                }
+                            }
                         }
                         let x = tile.right() + 10.0;
                         let title = match meta.kind {
@@ -1512,10 +1552,10 @@ impl App {
                                 .ocr
                                 .as_deref()
                                 .map(one_line)
-                                .filter(|t| !t.is_empty() && t != "(空白)")
-                                .unwrap_or_else(|| format!("图片 {}×{}", meta.width, meta.height)),
+                                .filter(|t| !t.is_empty() && t != t!("(空白)", "(blank)"))
+                                .unwrap_or_else(|| tf!("图片 {}×{}", "image {}×{}", meta.width, meta.height)),
                         };
-                        let mut job = LayoutJob::single_section(title, TextFormat { font_id: FontId::proportional(13.5), color: pal.text, ..Default::default() });
+                        let mut job = LayoutJob::single_section(title, TextFormat { font_id: FontId::proportional(13.0), color: if selected { pal.accent } else { pal.text }, ..Default::default() });
                         job.wrap.max_width = (right - x).max(30.0);
                         job.wrap.max_rows = 1;
                         job.wrap.break_anywhere = true;
@@ -1543,35 +1583,40 @@ impl App {
         action
     }
 
+    /// Type column of a row: a terminal-style tag ("url", "code" …), a color
+    /// swatch for colors, a small thumbnail for images.
     fn paint_tile(&mut self, ui: &egui::Ui, ctx: &egui::Context, pal: &Palette, tile: Rect, meta: &ItemMeta, kind: TextKind) {
+        let p = ui.painter();
         if meta.kind == Kind::Image {
             if let Some(tex) = self.thumb(ctx, meta.id) {
                 let ts = tex.size_vec2();
-                // center-crop to a square
-                let uv = if ts.x > ts.y {
-                    let f = ts.y / ts.x;
-                    Rect::from_min_max(Pos2::new((1.0 - f) / 2.0, 0.0), Pos2::new((1.0 + f) / 2.0, 1.0))
-                } else {
-                    let f = ts.x / ts.y;
-                    Rect::from_min_max(Pos2::new(0.0, (1.0 - f) / 2.0), Pos2::new(1.0, (1.0 + f) / 2.0))
-                };
-                egui::Image::from_texture((tex.id(), tile.size())).uv(uv).corner_radius(5).paint_at(ui, tile);
-                ui.painter().rect_stroke(tile, 5, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+                let r = Rect::from_center_size(tile.center(), Vec2::new(tile.width(), tile.height()));
+                let s = (r.width() / ts.x).min(r.height() / ts.y);
+                let img = Rect::from_center_size(r.center(), ts * s);
+                egui::Image::from_texture((tex.id(), img.size())).paint_at(ui, img);
+                p.rect_stroke(img, 0, Stroke::new(1.0, pal.border), egui::StrokeKind::Outside);
                 return;
             }
         }
-        let p = ui.painter();
         if kind == TextKind::Color {
             if let Some(c) = kinds::parse_color(&meta.preview).map(color32) {
-                p.rect_filled(tile, 5, c);
-                p.rect_stroke(tile, 5, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+                let sw = Rect::from_center_size(tile.center(), Vec2::new(tile.width() - 6.0, tile.height() - 4.0));
+                p.rect_filled(sw, 0, c);
+                p.rect_stroke(sw, 0, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
                 return;
             }
         }
-        let tint = pal.tint(kind);
-        p.rect_filled(tile, 5, tint.gamma_multiply(if pal.dark { 0.22 } else { 0.14 }));
-        let size = if kind.glyph().chars().count() > 2 { 8.5 } else { 11.0 };
-        p.text(tile.center(), Align2::CENTER_CENTER, kind.glyph(), FontId::proportional(size), tint);
+        let tag = match kind {
+            TextKind::Plain => "txt",
+            TextKind::Url => "url",
+            TextKind::Email => "mail",
+            TextKind::Path => "path",
+            TextKind::Color => "hex",
+            TextKind::Json => "json",
+            TextKind::Code => "code",
+            TextKind::Image => "img",
+        };
+        p.text(tile.left_center(), Align2::LEFT_CENTER, tag, FontId::proportional(11.5), pal.tint(kind));
     }
 
     /// Detail pane: content on top, metadata table below (Raycast style).
@@ -1583,13 +1628,13 @@ impl App {
             Detail::Image { .. } => TextKind::Image,
             Detail::Missing => TextKind::Plain,
         };
-        let mut rows: Vec<(&str, String)> = vec![("类型", kind.label().to_string()), ("来源", meta.source.clone().unwrap_or_else(|| "本机".into()))];
+        let mut rows: Vec<(&str, String)> = vec![(t!("类型", "type"), kind.label().to_string()), (t!("来源", "source"), meta.source.clone().unwrap_or_else(|| t!("本机", "this device").into()))];
         rows.push(match meta.kind {
-            Kind::Text => ("内容", format!("{} 字符 · {} 行", meta.chars, meta.lines)),
-            Kind::Image => ("尺寸", format!("{} × {}", meta.width, meta.height)),
+            Kind::Text => (t!("内容", "content"), tf!("{} 字符 · {} 行", "{} chars · {} lines", meta.chars, meta.lines)),
+            Kind::Image => (t!("尺寸", "dimensions"), format!("{} × {}", meta.width, meta.height)),
         });
-        rows.push(("大小", human_size(meta.bytes)));
-        rows.push(("复制时间", abs_time(meta.created, self.tz)));
+        rows.push((t!("大小", "size"), human_size(meta.bytes)));
+        rows.push((t!("复制时间", "copied"), abs_time(meta.created, self.tz)));
         let mut meta_h = 30.0 + rows.len() as f32 * 25.0;
 
         egui::Frame::new().inner_margin(Margin { left: 16, right: 16, top: 14, bottom: 8 }).show(ui, |ui| {
@@ -1614,7 +1659,7 @@ impl App {
             let w = ui.available_width();
             let (title, _) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::hover());
             ui.painter().hline(title.x_range(), title.top() + 6.0, Stroke::new(1.0, pal.border));
-            ui.painter().text(Pos2::new(title.left(), title.bottom() - 4.0), Align2::LEFT_BOTTOM, "信息", FontId::proportional(11.5), pal.faint);
+            ui.painter().text(Pos2::new(title.left(), title.bottom() - 4.0), Align2::LEFT_BOTTOM, t!("信息", "info"), FontId::proportional(11.5), pal.faint);
             for (k, v) in rows {
                 let (r, _) = ui.allocate_exact_size(Vec2::new(w, 25.0), Sense::hover());
                 let p = ui.painter();
@@ -1631,7 +1676,7 @@ impl App {
         let Some((_, detail)) = &self.detail else { return };
         match detail {
             Detail::Missing => {
-                ui.label(RichText::new("无法读取内容").color(pal.danger));
+                ui.label(RichText::new(t!("无法读取内容", "cannot read the content")).color(pal.danger));
             }
             Detail::Image { tex } => {
                 let ocr_text = meta.ocr.clone().filter(|t| !t.trim().is_empty());
@@ -1649,19 +1694,19 @@ impl App {
                 match (&ocr_text, &meta.ocr) {
                     (Some(t), _) => {
                         ui.add_space(6.0);
-                        ui.label(RichText::new("图中文字").size(11.5).strong().color(pal.dim));
+                        ui.label(RichText::new(t!("图中文字", "text in the image")).size(11.5).strong().color(pal.dim));
                         egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt(("ocr", id)).show(ui, |ui| {
                             ui.add(egui::Label::new(RichText::new(t).size(12.5).color(pal.text)).wrap().selectable(true));
                         });
                     }
                     (None, None) if self.ocr_available => {
-                        ui.label(RichText::new("正在识别图中文字…").size(11.5).color(pal.faint));
+                        ui.label(RichText::new(t!("正在识别图中文字…", "recognizing text…")).size(11.5).color(pal.faint));
                     }
                     (None, None) => {
-                        ui.label(RichText::new("未启用图片文字识别").size(11.5).color(pal.faint));
+                        ui.label(RichText::new(t!("未启用图片文字识别", "text recognition is off")).size(11.5).color(pal.faint));
                     }
                     _ => {
-                        ui.label(RichText::new("图中未识别到文字").size(11.5).color(pal.faint));
+                        ui.label(RichText::new(t!("图中未识别到文字", "no text found in the image")).size(11.5).color(pal.faint));
                     }
                 }
             }
@@ -1677,12 +1722,12 @@ impl App {
                         let target = if p.is_dir() { Some(p) } else { p.parent().filter(|d| d.is_dir()) };
                         match target {
                             Some(dir) => {
-                                if ui.button("在文件管理器中打开").clicked() {
+                                if ui.button(t!("在文件管理器中打开", "show in file manager")).clicked() {
                                     open_external(&dir.to_string_lossy());
                                 }
                             }
                             None => {
-                                ui.label(RichText::new("本机上不存在这个路径").size(11.5).color(pal.faint));
+                                ui.label(RichText::new(t!("本机上不存在这个路径", "this path does not exist here")).size(11.5).color(pal.faint));
                             }
                         }
                     }
@@ -1712,9 +1757,9 @@ impl App {
                     self.sync_pairing = None;
                     let before = self.sync.as_ref().map(|o| o.peers.len()).unwrap_or(0);
                     self.sync_msg = Some(if s.peers.len() > before {
-                        ("配对成功，已开始同步".into(), false)
+                        (t!("配对成功，已开始同步", "paired, syncing").into(), false)
                     } else {
-                        ("配对窗口已关闭".into(), false)
+                        (t!("配对窗口已关闭", "pairing window closed").into(), false)
                     });
                 }
             }
@@ -1733,7 +1778,7 @@ impl App {
             if let Ok(res) = rx.try_recv() {
                 self.sync_job = None;
                 self.sync_msg = Some(match res {
-                    Ok(name) => (format!("已与 {name} 配对，开始同步"), false),
+                    Ok(name) => (tf!("已与 {name} 配对，开始同步", "paired with {name}, syncing"), false),
                     Err(e) => (e, true),
                 });
                 self.sync_input.clear();
@@ -1741,28 +1786,31 @@ impl App {
             }
         }
         let info = self.sync.clone();
+        if dialog_vim_keys(ctx).2 {
+            self.sync_open = false;
+        }
         let modal = egui::Modal::new(egui::Id::unique("sync-panel"))
             .frame(dialog_frame(pal))
             .show(ctx, |ui| {
                 let (w, h) = dialog_room(ctx, 420.0);
                 ui.set_width(w);
                 egui::ScrollArea::vertical().max_height(h).auto_shrink([false, true]).show(ui, |ui| {
-                    ui.label(RichText::new("局域网同步").size(16.0).strong().color(pal.text));
-                    ui.label(RichText::new("端到端加密 · 仅同一局域网 · 收到的内容只进入历史，不会改动剪贴板").size(11.5).color(pal.faint));
+                    ui.label(RichText::new(t!("局域网同步", "LAN sync")).size(16.0).strong().color(pal.text));
+                    ui.label(RichText::new(t!("端到端加密 · 仅同一局域网 · 收到的内容只进入历史，不会改动剪贴板", "end-to-end encrypted · same LAN only · received items go to history, never to the clipboard")).size(11.5).color(pal.faint));
                     ui.add_space(8.0);
                     let Some(info) = info else {
-                        ui.label(RichText::new("无法获取同步状态").color(pal.danger));
+                        ui.label(RichText::new(t!("无法获取同步状态", "cannot get the sync status")).color(pal.danger));
                         return;
                     };
                     if !info.enabled {
-                        ui.label(RichText::new("同步已在设置中关闭（sync_enabled = false）").color(pal.dim));
+                        ui.label(RichText::new(t!("同步已在设置中关闭（sync_enabled = false）", "sync is off in the settings (sync_enabled = false)")).color(pal.dim));
                         return;
                     }
                     section(ui, pal, |ui| {
-                        ui.label(RichText::new(format!("本机：{}", info.device_name)).color(pal.text));
+                        ui.label(RichText::new(tf!("本机：{}", "this device: {}", info.device_name)).color(pal.text));
                         if info.paired {
                             if info.peers.is_empty() {
-                                ui.label(RichText::new("暂无设备在线（已配对的设备在同一局域网时会自动连接）").size(12.0).color(pal.faint));
+                                ui.label(RichText::new(t!("暂无设备在线（已配对的设备在同一局域网时会自动连接）", "no device online (paired devices connect when on the same LAN)")).size(12.0).color(pal.faint));
                             } else {
                                 for (name, addr) in &info.peers {
                                     ui.horizontal(|ui| {
@@ -1774,40 +1822,40 @@ impl App {
                                 }
                             }
                         } else {
-                            ui.label(RichText::new("尚未与其他设备配对").size(12.0).color(pal.faint));
+                            ui.label(RichText::new(t!("尚未与其他设备配对", "not paired with any device")).size(12.0).color(pal.faint));
                         }
                     });
                     ui.add_space(8.0);
 
                     // Invite another device.
                     if let Some((code, addrs)) = self.sync_pairing.clone() {
-                        ui.label(RichText::new("在另一台设备的 copym 里输入配对码：").size(12.5).color(pal.dim));
+                        ui.label(RichText::new(t!("在另一台设备的 copym 里输入配对码：", "enter this code in copym on the other device:")).size(12.5).color(pal.dim));
                         ui.label(RichText::new(&code).monospace().size(30.0).strong().color(pal.accent));
                         if let Some(a) = addrs.first() {
-                            ui.label(RichText::new(format!("找不到本机时，输入 {code}@{a}")).size(11.5).color(pal.faint));
+                            ui.label(RichText::new(tf!("找不到本机时，输入 {code}@{a}", "if not found, enter {code}@{a}")).size(11.5).color(pal.faint));
                         }
-                        ui.label(RichText::new("3 分钟内有效，只能尝试一次").size(11.5).color(pal.faint));
-                    } else if ui.add(primary_button(pal, "添加设备（生成配对码）")).clicked() {
+                        ui.label(RichText::new(t!("3 分钟内有效，只能尝试一次", "valid for 3 minutes, one attempt")).size(11.5).color(pal.faint));
+                    } else if ui.add(primary_button(pal, t!("添加设备（生成配对码）", "add a device (pairing code)"))).clicked() {
                         match self.req(&Request::SyncPair) {
                             Some(Response::Pairing { code, addrs, .. }) => {
                                 self.sync_pairing = Some((code, addrs));
                                 self.sync_msg = None;
                             }
-                            _ => self.sync_msg = Some((self.error.take().unwrap_or_else(|| "无法开始配对".into()), true)),
+                            _ => self.sync_msg = Some((self.error.take().unwrap_or_else(|| t!("无法开始配对", "cannot start pairing").into()), true)),
                         }
                         self.refresh_sync();
                     }
                     ui.add_space(10.0);
 
                     // Join another device.
-                    ui.label(RichText::new("加入另一台设备").size(12.5).color(pal.dim));
+                    ui.label(RichText::new(t!("加入另一台设备", "join another device")).size(12.5).color(pal.dim));
                     ui.horizontal(|ui| {
                         let busy = self.sync_job.is_some();
                         ui.add_enabled(
                             !busy,
-                            egui::TextEdit::singleline(&mut self.sync_input).hint_text("8 位配对码，可附 @IP:端口").desired_width(270.0).margin(Margin::symmetric(8, 5)),
+                            egui::TextEdit::singleline(&mut self.sync_input).hint_text(t!("8 位配对码，可附 @IP:端口", "8-digit code, optionally @IP:port")).desired_width(270.0).margin(Margin::symmetric(8, 5)),
                         );
-                        let label = if busy { "正在配对…" } else { "加入" };
+                        let label = if busy { t!("正在配对…", "pairing…") } else { t!("加入", "join") };
                         if ui.add_enabled(!busy && !self.sync_input.trim().is_empty(), egui::Button::new(label)).clicked() {
                             let input = self.sync_input.trim().to_string();
                             let (code, addr) = match input.split_once('@') {
@@ -1837,15 +1885,15 @@ impl App {
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         if info.paired
-                            && ui.add(egui::Button::new(RichText::new("退出同步组").color(pal.danger))).on_hover_text("忘记同步密钥并断开所有设备").clicked()
+                            && ui.add(egui::Button::new(RichText::new(t!("退出同步组", "leave the sync group")).color(pal.danger))).on_hover_text(t!("忘记同步密钥并断开所有设备", "forget the sync key and disconnect all devices")).clicked()
                         {
                             self.req(&Request::SyncLeave);
                             self.sync_pairing = None;
-                            self.sync_msg = Some(("已退出同步组".into(), false));
+                            self.sync_msg = Some((t!("已退出同步组", "left the sync group").into(), false));
                             self.refresh_sync();
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.button("关闭").clicked() {
+                            if ui.button(t!("关闭", "close")).clicked() {
                                 self.sync_open = false;
                             }
                         });
@@ -1854,6 +1902,21 @@ impl App {
             });
         if modal.should_close() {
             self.sync_open = false;
+        }
+    }
+
+    /// Dark or light: the `theme` setting, or the system's.
+    fn wants_dark(&self, ctx: &egui::Context) -> bool {
+        match self.cfg.theme.as_str() {
+            "dark" => true,
+            "light" => false,
+            _ => {
+                #[cfg(target_os = "linux")]
+                if let Some(dark) = crate::system_theme::dark() {
+                    return dark;
+                }
+                ctx.system_theme().is_none_or(|t| t == egui::Theme::Dark)
+            }
         }
     }
 
@@ -1876,118 +1939,6 @@ impl App {
         true
     }
 
-    fn ignore_panel(&mut self, ctx: &egui::Context, pal: &Palette) {
-        let Some(mut dlg) = self.ignore.take() else { return };
-        if self.sync.is_none() {
-            self.refresh_sync(); // to tell synced devices from apps
-        }
-        let mut keep = true;
-        let mut apps = self.cfg.ignore_apps.clone();
-        let mut changed = false;
-        // apps seen in the history, newest first
-        let mut recent: Vec<String> = Vec::new();
-        for m in &self.items {
-            if let Some(a) = m.source.as_deref().filter(|a| self.is_local_app(a)) {
-                if !recent.iter().any(|r| r == a) {
-                    recent.push(a.to_string());
-                }
-            }
-        }
-        recent.truncate(12);
-        let modal = egui::Modal::new(egui::Id::unique("ignore-apps")).frame(dialog_frame(pal)).show(ctx, |ui| {
-            let (w, h) = dialog_room(ctx, 440.0);
-            ui.set_width(w);
-            ui.label(RichText::new("不记录的应用").size(16.0).strong().color(pal.text));
-            let hint = if cfg!(target_os = "linux") {
-                "Linux 上无法得知是哪个应用复制的，这里的设置不生效；可以用 ignore_patterns 按内容排除"
-            } else {
-                "从这些应用复制的内容不会进入历史。按名称包含匹配，不区分大小写，立即生效"
-            };
-            ui.label(RichText::new(hint).size(11.5).color(pal.faint));
-            ui.add_space(8.0);
-            egui::ScrollArea::vertical().max_height((h - 190.0).max(80.0)).auto_shrink([false, true]).show(ui, |ui| {
-                section(ui, pal, |ui| {
-                    if apps.is_empty() {
-                        ui.label(RichText::new("（没有）").size(12.5).color(pal.faint));
-                    }
-                    let mut remove = None;
-                    for (i, a) in apps.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(a).size(13.0).color(pal.text));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.small_button("移除").clicked() {
-                                    remove = Some(i);
-                                }
-                            });
-                        });
-                    }
-                    if let Some(i) = remove {
-                        apps.remove(i);
-                        changed = true;
-                    }
-                });
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let add_w = 64.0;
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut dlg.input)
-                        .hint_text(if cfg!(windows) { "应用名或进程名，例：chrome.exe" } else { "应用名，例：微信" })
-                        .desired_width(ui.available_width() - add_w - 8.0)
-                        .margin(Margin::symmetric(8, 4)),
-                );
-                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                if (ui.add_enabled(!dlg.input.trim().is_empty(), egui::Button::new("添加").min_size(Vec2::new(add_w, 0.0))).clicked() || enter)
-                    && !dlg.input.trim().is_empty()
-                {
-                    apps.push(dlg.input.trim().to_string());
-                    dlg.input.clear();
-                    changed = true;
-                }
-            });
-            if !recent.is_empty() {
-                ui.add_space(6.0);
-                ui.label(RichText::new("最近复制过的应用（点击添加）").size(12.0).color(pal.dim));
-                ui.horizontal_wrapped(|ui| {
-                    for a in &recent {
-                        if ui.small_button(format!("＋ {a}")).clicked() {
-                            apps.push(a.clone());
-                            changed = true;
-                        }
-                    }
-                });
-            }
-            if let Some((msg, err)) = &dlg.msg {
-                ui.add_space(4.0);
-                ui.label(RichText::new(msg).size(12.0).color(if *err { pal.danger } else { pal.ok }));
-            }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.button("恢复默认").on_hover_text("常见的密码管理器").clicked() {
-                    apps = Config::default().ignore_apps;
-                    changed = true;
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("关闭").clicked() {
-                        keep = false;
-                    }
-                });
-            });
-        });
-        if changed {
-            dlg.msg = Some(if self.set_ignored(apps) {
-                ("已保存".into(), false)
-            } else {
-                (format!("保存失败：{}", self.error.take().unwrap_or_default()), true)
-            });
-        }
-        if modal.should_close() {
-            keep = false;
-        }
-        if keep {
-            self.ignore = Some(dlg);
-        }
-    }
 
     fn group_editor(&mut self, ctx: &egui::Context, pal: &Palette) {
         let Some(mut ed) = self.editor.take() else { return };
@@ -1996,20 +1947,30 @@ impl App {
             ed.store_bufs();
             let rule = ed.draft.rule(ed.sel);
             ed.count = match self.req(&Request::GroupCounts { query: String::new(), regex: false, groups: vec![rule] }) {
-                Some(Response::Counts(c)) => c.into_iter().next(),
+                Some(Response::GroupCounts { counts, .. }) => counts.into_iter().next(),
                 _ => None,
             };
         }
         let mut keep = true;
         let mut saved = false;
+        // keyboard: j/k groups, Ctrl-S save, q / Esc close; Esc in a field only leaves it
+        let (nav, save_key, close_key) = dialog_vim_keys(ctx);
+        if nav != 0 && !ed.draft.list.is_empty() {
+            ed.store_bufs();
+            let n = ed.draft.list.len() as isize;
+            ed.select((ed.sel as isize + nav).rem_euclid(n) as usize);
+        }
+        if close_key {
+            keep = false;
+        }
         const BODY_H: f32 = 296.0;
         let modal = egui::Modal::new(egui::Id::unique("group-editor")).frame(dialog_frame(pal).inner_margin(Margin::same(16))).show(ctx, |ui| {
             let (w, h) = dialog_room(ctx, 560.0);
             ui.set_width(w);
             ui.spacing_mut().item_spacing.y = 5.0;
-            ui.label(RichText::new("管理分组").size(16.0).strong().color(pal.text));
+            ui.label(RichText::new(t!("管理分组", "manage groups")).size(16.0).strong().color(pal.text));
             ui.label(
-                RichText::new(format!("分组按顺序对应 {KEY_GROUP}1…9；条目可以同时属于多个分组。规则保存在 groups.toml。"))
+                RichText::new(tf!("分组按顺序对应 {KEY_GROUP}1…9；条目可以同时属于多个分组。规则保存在 groups.toml。", "groups map to {KEY_GROUP}1…9 in order; an item can be in several groups. Saved in groups.toml."))
                     .size(11.5)
                     .color(pal.faint),
             );
@@ -2027,7 +1988,7 @@ impl App {
                                 for (i, g) in ed.draft.list.iter().enumerate() {
                                     let mut label = if i < 9 { format!("{}   {}", i + 1, g.name) } else { format!("     {}", g.name) };
                                     if ed.draft.default == g.name {
-                                        label.push_str("  · 默认");
+                                        label.push_str(t!("  · 默认", "  · default"));
                                     }
                                                     let button = egui::Button::selectable(i == ed.sel, label).min_size(Vec2::new(146.0, 26.0)).truncate();
                                     if ui.add(button).on_hover_text(&g.name).clicked() {
@@ -2042,15 +2003,15 @@ impl App {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            if ui.small_button("＋ 新建").clicked() {
+                            if ui.small_button(t!("＋ 新建", "+ new")).clicked() {
                                 ed.store_bufs();
                                 let n = ed.draft.list.len() + 1;
-                                ed.draft.list.push(GroupDef { name: format!("分组 {n}"), ..Default::default() });
+                                ed.draft.list.push(GroupDef { name: tf!("分组 {n}", "group {n}"), ..Default::default() });
                                 ed.sel = ed.draft.list.len() - 1;
                                 ed.load_bufs();
                             }
                             let can_delete = ed.draft.list.len() > 1;
-                            if ui.add_enabled(can_delete, egui::Button::new("删除").small()).clicked() {
+                            if ui.add_enabled(can_delete, egui::Button::new(t!("删除", "delete")).small()).clicked() {
                                 ed.draft.list.remove(ed.sel);
                                 ed.sel = ed.sel.min(ed.draft.list.len() - 1);
                                 ed.load_bufs();
@@ -2058,12 +2019,12 @@ impl App {
                         });
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            if ui.add_enabled(ed.sel > 0, egui::Button::new("上移").small()).clicked() {
+                            if ui.add_enabled(ed.sel > 0, egui::Button::new(t!("上移", "up")).small()).clicked() {
                                 ed.store_bufs();
                                 ed.draft.list.swap(ed.sel, ed.sel - 1);
                                 ed.sel -= 1;
                             }
-                            if ui.add_enabled(ed.sel + 1 < ed.draft.list.len(), egui::Button::new("下移").small()).clicked() {
+                            if ui.add_enabled(ed.sel + 1 < ed.draft.list.len(), egui::Button::new(t!("下移", "down")).small()).clicked() {
                                 ed.store_bufs();
                                 ed.draft.list.swap(ed.sel, ed.sel + 1);
                                 ed.sel += 1;
@@ -2077,48 +2038,76 @@ impl App {
                     ui.vertical(|ui| {
                         let sel = ed.sel;
                         let default_name = ed.draft.default.clone();
+                        let next_board = ed.draft.next_board();
                         let Some(g) = ed.draft.list.get_mut(sel) else { return };
                         let mut changed = false;
                         let old_name = g.name.clone();
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("名称").size(12.0).color(pal.dim));
+                            ui.label(RichText::new(t!("名称", "name")).size(12.0).color(pal.dim));
                             changed |= ui.add(egui::TextEdit::singleline(&mut g.name).desired_width(f32::INFINITY).margin(Margin::symmetric(8, 4))).changed();
                         });
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("内容类型").size(12.0).color(pal.dim));
-                            for (v, l) in [("", "全部"), ("text", "文本"), ("image", "图片")] {
+                            ui.label(RichText::new(t!("内容类型", "content")).size(12.0).color(pal.dim));
+                            for (v, l) in [("", t!("全部", "all")), ("text", t!("文本", "text")), ("image", t!("图片", "images"))] {
                                 changed |= ui.selectable_value(&mut g.kind, v.to_string(), l).changed();
                             }
                         });
-                        changed |= ui.checkbox(&mut g.pinned, "只包含固定的条目").changed();
+                        changed |= ui.checkbox(&mut g.pinned, t!("只包含固定的条目", "pinned items only")).changed();
                         changed |= ui
-                            .checkbox(&mut g.rest, "“其他”分组：不属于任何带规则分组的条目")
-                            .on_hover_text("排除其他所有分组的内容正则和来源应用正则所匹配的条目")
+                            .checkbox(&mut g.rest, t!("“其他”分组：不属于任何带规则分组的条目", "“other” group: items no rule-based group takes"))
+                            .on_hover_text(t!("排除其他所有分组的内容正则和来源应用正则所匹配的条目", "leaves out what the content and source rules of the other groups match"))
                             .changed();
+                        let mut is_board = g.board > 0;
+                        if ui
+                            .checkbox(&mut is_board, t!("固定分组：条目手动放进来（m + 按键，或全局快捷键）", "pin group: items are put here by hand (m + key, or a global shortcut)"))
+                            .changed()
+                        {
+                            g.board = if is_board { next_board } else { 0 };
+                            g.pinned = is_board;
+                            changed = true;
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(t!("按键", "key")).size(12.0).color(pal.dim));
+                            changed |= ui.add(egui::TextEdit::singleline(&mut g.key).char_limit(1).desired_width(24.0).margin(Margin::symmetric(6, 4))).changed();
+                            let hint = if g.board > 0 { t!("' 跳到分组 · m 放进分组", "' go to · m put into") } else { t!("' 跳到分组", "' go to the group") };
+                            ui.label(RichText::new(hint).size(11.5).color(pal.faint));
+                        });
+                        if g.board > 0 {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(t!("全局快捷键", "global shortcut")).size(12.0).color(pal.dim));
+                                changed |= ui
+                                    .add(egui::TextEdit::singleline(&mut g.hotkey).hint_text("Ctrl+Alt+1").desired_width(150.0).margin(Margin::symmetric(8, 4)))
+                                    .on_hover_text(t!("不用打开弹窗，把当前剪贴板的内容放进这个分组；重启 copym 后生效", "puts the current clipboard into this group without opening the popup; takes effect after restarting copym"))
+                                    .changed();
+                            });
+                        }
+                        let rules_shown = g.board == 0;
                         ui.add_space(4.0);
-                        ui.label(RichText::new("内容正则（每行一条，匹配任意一条即可；(?i) 忽略大小写）").size(12.0).color(pal.dim));
+                        if rules_shown {
+                        ui.label(RichText::new(t!("内容正则（每行一条，匹配任意一条即可；(?i) 忽略大小写）", "content regexes (one per line, any may match; (?i) ignores case)")).size(12.0).color(pal.dim));
                         changed |= ui
                             .add(
                                 egui::TextEdit::multiline(&mut ed.patterns)
                                     .font(FontId::monospace(12.5))
                                     .desired_rows(2)
                                     .desired_width(f32::INFINITY)
-                                    .hint_text(r"例：^\s*https?://"),
+                                    .hint_text(t!(r"例：^\s*https?://", r"e.g. ^\s*https?://")),
                             )
                             .changed();
-                        ui.label(RichText::new("来源正则：来源应用或同步设备名（每行一条，可留空）").size(12.0).color(pal.dim));
+                        ui.label(RichText::new(t!("来源正则：来源应用或同步设备名（每行一条，可留空）", "source regexes: app or synced device name (one per line, optional)")).size(12.0).color(pal.dim));
                         changed |= ui
                             .add(
                                 egui::TextEdit::multiline(&mut ed.apps)
                                     .font(FontId::monospace(12.5))
                                     .desired_rows(2)
                                     .desired_width(f32::INFINITY)
-                                    .hint_text("例：(?i)chrome|firefox"),
+                                    .hint_text(t!("例：(?i)chrome|firefox", "e.g. (?i)chrome|firefox")),
                             )
                             .changed();
+                        }
                         let g = &ed.draft.list[sel];
                         let mut is_default = default_name == g.name;
-                        if ui.checkbox(&mut is_default, "打开弹窗时默认显示这个分组").changed() && is_default {
+                        if ui.checkbox(&mut is_default, t!("打开弹窗时默认显示这个分组", "show this group when the popup opens")).changed() && is_default {
                             ed.draft.default = g.name.clone();
                         }
                         if ed.draft.default == old_name && old_name != ed.draft.list[sel].name {
@@ -2136,7 +2125,7 @@ impl App {
                             }
                             Ok(()) => {
                                 let txt = match ed.count {
-                                    Some(Some(n)) => format!("当前历史中有 {n} 条属于这个分组"),
+                                    Some(Some(n)) => tf!("当前历史中有 {n} 条属于这个分组", "{n} items of the history are in this group"),
                                     _ => String::new(),
                                 };
                                 ui.label(RichText::new(txt).size(12.0).color(pal.ok));
@@ -2150,30 +2139,23 @@ impl App {
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("恢复默认分组").clicked() {
+                if ui.button(t!("恢复默认分组", "reset to default groups")).clicked() {
                     ed.draft = Groups::default();
                     ed.sel = 0;
                     ed.load_bufs();
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(primary_button(pal, "保存")).clicked() {
+                    if ui.add(primary_button(pal, t!("保存", "save"))).on_hover_text("Ctrl-S").clicked() || save_key {
                         ed.store_bufs();
-                        let mut names = std::collections::HashSet::new();
-                        let err = ed
-                            .draft
-                            .list
-                            .iter()
-                            .find_map(|g| g.validate().err().map(|e| format!("「{}」：{e}", g.name)))
-                            .or_else(|| ed.draft.list.iter().find(|g| !names.insert(g.name.trim().to_string())).map(|g| format!("分组名称重复：{}", g.name)));
-                        match err {
+                        match ed.draft.validate().err() {
                             Some(e) => ed.error = Some(e),
                             None => match groups::save(&ed.draft) {
                                 Ok(()) => saved = true,
-                                Err(e) => ed.error = Some(format!("保存失败：{e}")),
+                                Err(e) => ed.error = Some(tf!("保存失败：{e}", "save failed: {e}")),
                             },
                         }
                     }
-                    if ui.button("取消").clicked() {
+                    if ui.button(t!("取消", "cancel")).clicked() {
                         keep = false;
                     }
                 });
@@ -2183,12 +2165,18 @@ impl App {
             keep = false;
         }
         if saved {
+            let shortcuts = |g: &Groups| -> Vec<(u32, String)> { g.boards().map(|(_, d)| (d.board, d.hotkey.trim().to_string())).collect() };
+            let restart = shortcuts(&self.groups) != shortcuts(&ed.draft);
             let current = self.groups.list.get(self.group).map(|g| g.name.clone());
             self.groups = ed.draft;
             self.groups_error = None;
             self.group = current.and_then(|n| self.groups.list.iter().position(|g| g.name == n)).unwrap_or(0);
             self.dirty = true;
-            self.notify("分组已保存");
+            if restart {
+                self.notify(t!("分组已保存，全局快捷键在重启 copym 后生效（:restart）", "groups saved; global shortcuts take effect after a restart (:restart)"));
+            } else {
+                self.notify(t!("分组已保存", "groups saved"));
+            }
         } else if keep {
             self.editor = Some(ed);
         }
@@ -2196,61 +2184,117 @@ impl App {
 
     /// Bottom action bar: context on the left, primary action and the action
     /// panel shortcut on the right.
+    /// Vim-like status line: mode, context, pending keys, key hints; the
+    /// `:` command line replaces it in COMMAND mode.
     fn footer(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), FOOTER_H), Sense::hover());
-        let p = ui.painter();
-        p.hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, pal.border));
-        // left: app badge + context
-        let badge = Rect::from_center_size(Pos2::new(rect.left() + 22.0, rect.center().y), Vec2::splat(18.0));
-        p.rect_filled(badge, 5, pal.accent);
-        p.text(badge.center(), Align2::CENTER_CENTER, "c", FontId::proportional(12.0), pal.on_accent);
+        ui.painter().hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, pal.border));
+        let mode = self.mode();
+        let (label, color) = match mode {
+            Mode::Normal => (" NORMAL ", pal.accent),
+            Mode::Insert => (" INSERT ", pal.tint(TextKind::Url)),
+            Mode::Command => (" COMMAND ", pal.tint(TextKind::Json)),
+        };
+        let g = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(12.0), pal.on_accent);
+        let block = Rect::from_min_size(Pos2::new(rect.left() + 10.0, rect.center().y - 10.0), Vec2::new(g.size().x + 4.0, 20.0));
+        ui.painter().rect_filled(block, 0, color);
+        ui.painter().galley(Pos2::new(block.left() + 2.0, block.center().y - g.size().y / 2.0), g, pal.on_accent);
 
-        // right: "粘贴 ⏎ | 操作 ⌘K | ⏻"
+        if let Some(cmd) = &mut self.cmdline {
+            let r = Rect::from_min_max(Pos2::new(block.right() + 10.0, rect.top() + 6.0), Pos2::new(rect.right() - 12.0, rect.bottom() - 6.0));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(r).layout(Layout::left_to_right(Align::Center)), |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.label(RichText::new(":").font(FontId::proportional(13.5)).color(pal.text));
+                let edit = egui::TextEdit::singleline(cmd)
+                    .id(egui::Id::unique("cmdline"))
+                    .font(FontId::proportional(13.5))
+                    .text_color(pal.text)
+                    .frame(egui::Frame::NONE)
+                    .margin(Margin::ZERO)
+                    .desired_width(ui.available_width());
+                ui.add(edit).request_focus();
+            });
+            return;
+        }
+
+        // right: key hints (clickable)
         let inner = rect.shrink2(Vec2::new(10.0, 6.0));
         let mut open_actions = false;
         let mut copy = false;
         let mut quit = false;
+        let mut help = false;
+        let mut open_url = None;
         let buttons = ui.scope_builder(egui::UiBuilder::new().max_rect(inner).layout(Layout::right_to_left(Align::Center)), |ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let quit_key = if cfg!(target_os = "macos") { "⌘Q" } else { "Ctrl+Q" };
-            if power_button(ui, pal).on_hover_text(format!("退出 copym（{quit_key}）")).clicked() {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if power_button(ui, pal).on_hover_text(t!("退出 copym（:q!）", "quit copym (:q!)")).clicked() {
                 quit = true;
             }
-            let (sep, _) = ui.allocate_exact_size(Vec2::new(9.0, 16.0), Sense::hover());
-            ui.painter().vline(sep.center().x, sep.y_range(), Stroke::new(1.0, pal.border));
-            if bar_button(ui, pal, "操作", KEY_ACTIONS, false).clicked() {
+            if bar_button(ui, pal, t!("帮助", "help"), "?", false).clicked() {
+                help = true;
+            }
+            if bar_button(ui, pal, t!("菜单", "menu"), "␣", false).clicked() {
                 open_actions = true;
             }
-            let (sep, _) = ui.allocate_exact_size(Vec2::new(9.0, 16.0), Sense::hover());
-            ui.painter().vline(sep.center().x, sep.y_range(), Stroke::new(1.0, pal.border));
-            let enter = if cfg!(target_os = "macos") { "⏎" } else { "Enter" };
-            let label = if self.cfg.paste_on_enter { "粘贴" } else { "复制到剪贴板" };
-            if !self.items.is_empty() && bar_button(ui, pal, label, enter, true).clicked() {
+            let label = if self.cfg.paste_on_enter { t!("粘贴", "paste") } else { t!("复制", "yank") };
+            if !self.items.is_empty() && bar_button(ui, pal, label, "⏎", true).clicked() {
                 copy = true;
             }
+            if let Some(u) = &self.update {
+                let link = ui
+                    .add(egui::Label::new(RichText::new(tf!("[新版本 {}]", "[v{} available]", u.version)).size(12.0).color(pal.accent)).sense(Sense::click()))
+                    .on_hover_text(t!("打开下载页面", "open the download page"))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if link.clicked() {
+                    open_url = Some(u.url.clone());
+                }
+            }
         });
-
-        // left: context, cut short before the buttons
-        let p = ui.painter();
-        let mut ctx_text = format!("剪贴板历史  ·  {}", self.groups.list.get(self.group).map(|g| g.name.as_str()).unwrap_or(""));
-        ctx_text.push_str(&format!("  ·  {} 条", self.items.len()));
-        if self.paused {
-            ctx_text.push_str("  ·  已暂停");
+        if let Some(url) = open_url {
+            open_external(&url);
         }
-        let x = badge.right() + 8.0;
-        let room = buttons.response.rect.left() - 16.0;
-        let sync = self.sync.as_ref().filter(|s| s.paired).map(|s| (s.peers.len(), format!("同步 {} 台", s.peers.len())));
-        let sync_galley = sync.as_ref().map(|(_, t)| p.layout_no_wrap(t.clone(), FontId::proportional(12.0), pal.dim));
-        let sync_w = sync_galley.as_ref().map_or(0.0, |g| g.size().x + 21.0);
-        // the sync status goes first when space is short
-        let (sync_galley, sync_w) = if room - x - sync_w < 120.0 { (None, 0.0) } else { (sync_galley, sync_w) };
-        let left = elided(p, &ctx_text, FontId::proportional(12.0), pal.dim, room - x - sync_w);
-        let left_w = left.size().x;
+
+        // middle: group · count · state, then the keys typed so far (showcmd)
+        let p = ui.painter();
+        // the group's count when known (pages load lazily), else what is loaded
+        let total = match self.counts.get(self.group).copied().flatten() {
+            Some(n) => format!("{n}{}", if self.counts_more { "+" } else { "" }),
+            None => format!("{}{}", self.items.len(), if self.next.is_some() { "+" } else { "" }),
+        };
+        let mut ctx_text = format!("{}  {}", self.groups.list.get(self.group).map(|g| g.name.as_str()).unwrap_or(""), tf!("{} 条", "{} items", total));
+        if !self.items.is_empty() {
+            ctx_text = format!("{}  {}/{}", ctx_text, self.selected + 1, total);
+        }
+        if self.next.is_some() && self.items.len() < PAGE as usize && !self.query.is_empty() {
+            ctx_text.push_str(t!("  搜索中…", "  searching…"));
+        }
+        if self.paused {
+            ctx_text.push_str(t!("  [已暂停]", "  [paused]"));
+        }
+        if let Some(sync) = self.sync.as_ref().filter(|s| s.paired) {
+            ctx_text.push_str(&tf!("  同步:{}", "  sync:{}", sync.peers.len()));
+        }
+        // which-key: after m / ' list the groups that answer to a key
+        let marks = |boards_only: bool| -> String {
+            self.groups
+                .list
+                .iter()
+                .filter(|g| (!boards_only || g.board > 0) && !g.key.is_empty())
+                .map(|g| format!("{} {}", g.key, g.name))
+                .collect::<Vec<_>>()
+                .join("  ")
+        };
+        match self.pending.trim_start_matches(|c: char| c.is_ascii_digit()) {
+            "m" => ctx_text = format!("{}  {}", t!("放进:", "put into:"), marks(true)),
+            "'" | "`" => ctx_text = format!("{}  {}", t!("跳到:", "go to:"), marks(false)),
+            _ => {}
+        }
+        let x = block.right() + 10.0;
+        let showcmd_w = if self.pending.is_empty() { 0.0 } else { 60.0 };
+        let room = buttons.response.rect.left() - 12.0 - showcmd_w;
+        let left = elided(p, &ctx_text, FontId::proportional(12.0), pal.dim, room - x);
         p.galley(Pos2::new(x, rect.center().y - left.size().y / 2.0), left, pal.dim);
-        if let (Some(g), Some((n, _))) = (sync_galley, sync) {
-            let dot = Pos2::new(x + left_w + 14.0, rect.center().y);
-            p.circle_filled(dot, 3.0, if n > 0 { pal.ok } else { pal.faint });
-            p.galley(Pos2::new(dot.x + 7.0, rect.center().y - g.size().y / 2.0), g, pal.dim);
+        if !self.pending.is_empty() {
+            p.text(Pos2::new(room + showcmd_w, rect.center().y), Align2::RIGHT_CENTER, &self.pending, FontId::proportional(12.5), pal.accent);
         }
         if open_actions {
             self.actions = if self.actions.is_some() { None } else { Some(0) };
@@ -2260,6 +2304,9 @@ impl App {
         }
         if quit {
             self.pending_quit = true;
+        }
+        if help {
+            self.help = true;
         }
     }
 
@@ -2283,6 +2330,7 @@ impl App {
                     .shadow(egui::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(if pal.dark { 120 } else { 50 }) })
                     .show(ui, |ui| {
                         ui.set_width(300.0);
+                        egui::ScrollArea::vertical().max_height(screen.height() - FOOTER_H - 30.0).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 1.0;
                         let mut idx = 0;
                         for (n, row) in rows.iter().enumerate() {
@@ -2301,22 +2349,17 @@ impl App {
                                     let g = ui.painter().layout_job(job);
                                     ui.painter().galley(Pos2::new(r.left() + 10.0, r.center().y - g.size().y / 2.0), g, pal.faint);
                                 }
-                                PanelRow::Act(_, label, keys) => {
+                                PanelRow::Act(a, glyph, label, keys) => {
                                     let (r, resp) = ui.allocate_exact_size(Vec2::new(300.0, 32.0), Sense::click());
                                     if idx == sel {
                                         ui.painter().rect_filled(r, 7, pal.selected);
                                     }
-                                    let danger = label == "删除";
-                                    ui.painter().text(
-                                        r.left_center() + Vec2::new(10.0, 0.0),
-                                        Align2::LEFT_CENTER,
-                                        label,
-                                        FontId::proportional(13.5),
-                                        if danger { pal.danger } else { pal.text },
-                                    );
-                                    if !keys.is_empty() {
-                                        paint_keycap(ui.painter(), pal, r.right_center() - Vec2::new(10.0, 0.0), keys);
-                                    }
+                                    let danger = matches!(a, Act::Delete);
+                                    let color = if danger { pal.danger } else { pal.text };
+                                    ui.painter().text(r.left_center() + Vec2::new(20.0, 0.0), Align2::CENTER_CENTER, *glyph, icon_font(15.0), if danger { pal.danger } else { pal.dim });
+                                    let key_w = if keys.is_empty() { 0.0 } else { paint_keycap(ui.painter(), pal, r.right_center() - Vec2::new(10.0, 0.0), keys) + 14.0 };
+                                    let label = elided(ui.painter(), label, FontId::proportional(13.5), color, r.width() - 46.0 - key_w);
+                                    ui.painter().galley(Pos2::new(r.left() + 36.0, r.center().y - label.size().y / 2.0), label, color);
                                     if resp.hovered() && ui.input(|i| i.pointer.delta() != Vec2::ZERO) {
                                         hovered = Some(idx);
                                     }
@@ -2327,6 +2370,7 @@ impl App {
                                 }
                             }
                         }
+                        });
                     });
             });
         if let Some(h) = hovered {
@@ -2354,6 +2398,12 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+    }
+}
+
+impl App {
+    fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
 
         if self.resident.as_ref().is_some_and(|r| r.show.swap(false, Ordering::SeqCst)) {
@@ -2377,25 +2427,48 @@ impl eframe::App for App {
         let mut action = self.handle_keys(&ctx);
         if self.dirty {
             self.refresh();
+        } else {
+            self.load_more(&ctx);
         }
-        let pal = Palette::new(ui.visuals().dark_mode);
+        let dark = self.wants_dark(&ctx);
+        let theme = if dark { egui::Theme::Dark } else { egui::Theme::Light };
+        if ctx.theme() != theme {
+            ctx.set_theme(theme);
+            ctx.request_repaint();
+        }
+        let pal = Palette::new(dark);
         ctx.all_styles_mut(|s| {
-            s.visuals.selection.bg_fill = pal.accent.gamma_multiply(0.35);
-            s.visuals.selection.stroke = Stroke::new(1.0, pal.accent);
-            s.visuals.extreme_bg_color = if pal.dark { Color32::from_rgb(28, 28, 31) } else { Color32::from_rgb(244, 244, 246) };
-            s.visuals.window_fill = pal.surface;
-            s.visuals.panel_fill = pal.bg;
-            s.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, pal.border);
-            s.visuals.widgets.inactive.weak_bg_fill = pal.hover;
-            s.visuals.widgets.hovered.weak_bg_fill = pal.selected;
-            s.visuals.widgets.inactive.fg_stroke.color = pal.text;
-            s.visuals.widgets.noninteractive.fg_stroke.color = pal.text;
+            let v = &mut s.visuals;
+            v.selection.bg_fill = pal.accent.gamma_multiply(if pal.dark { 0.3 } else { 0.25 });
+            v.selection.stroke = Stroke::new(1.0, pal.accent);
+            v.extreme_bg_color = if pal.dark { Color32::from_rgb(4, 8, 5) } else { Color32::from_rgb(238, 234, 218) };
+            v.faint_bg_color = pal.hover;
+            v.code_bg_color = pal.hover;
+            v.hyperlink_color = pal.accent;
+            v.window_fill = pal.surface;
+            v.window_stroke = Stroke::new(1.0, pal.border);
+            v.panel_fill = pal.bg;
+            v.popup_shadow = egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(if pal.dark { 110 } else { 40 }) };
+            v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, pal.border);
+            v.widgets.noninteractive.fg_stroke.color = pal.text;
+            v.widgets.inactive.bg_fill = pal.hover;
+            v.widgets.inactive.weak_bg_fill = pal.hover;
+            v.widgets.inactive.bg_stroke = Stroke::new(1.0, pal.border);
+            v.widgets.inactive.fg_stroke.color = pal.text;
+            v.widgets.hovered.bg_fill = pal.selected;
+            v.widgets.hovered.weak_bg_fill = pal.selected;
+            v.widgets.hovered.bg_stroke = Stroke::new(1.0, pal.border.gamma_multiply(1.6));
+            v.widgets.hovered.fg_stroke.color = pal.text;
+            v.widgets.active.bg_fill = pal.selected;
+            v.widgets.active.weak_bg_fill = pal.selected;
+            v.widgets.active.fg_stroke.color = pal.text;
+            v.widgets.open.weak_bg_fill = pal.selected;
         });
 
         egui::Frame::new()
             .fill(pal.bg)
             .stroke(Stroke::new(1.0, pal.border))
-            .corner_radius(CornerRadius::same(12))
+            .corner_radius(CornerRadius::same(3))
             .show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -2411,7 +2484,7 @@ impl eframe::App for App {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
                             ui.label(RichText::new(err).color(pal.danger).size(12.0));
-                            if self.error.is_some() && ui.small_button("重试").clicked() {
+                            if self.error.is_some() && ui.small_button(t!("重试", "retry")).clicked() {
                                 self.error = None;
                                 self.connect();
                                 self.dirty = true;
@@ -2440,6 +2513,17 @@ impl eframe::App for App {
                 });
                 self.footer(ui, &pal);
             });
+
+        if pal.dark {
+            // faint CRT scanlines
+            let r = ctx.content_rect();
+            let p = ui.painter();
+            let mut y = r.top();
+            while y < r.bottom() {
+                p.hline(r.x_range(), y, Stroke::new(1.0, Color32::from_black_alpha(26)));
+                y += 3.0;
+            }
+        }
 
         if let Some(a) = self.action_panel(&ctx, &pal) {
             action = Some(a);
@@ -2479,14 +2563,34 @@ impl eframe::App for App {
         if self.frames < 4 {
             ctx.request_repaint();
         }
+        if let Some(rx) = &self.update_job {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.update_job = None;
+                    match res {
+                        Ok(Some(u)) => {
+                            self.notify(tf!("有新版本 {}，在操作面板里选“下载新版本”", "version {} is available: menu › download", u.version));
+                            self.update = Some(u);
+                        }
+                        Ok(None) => self.notify(tf!("已是最新版本（v{}）", "up to date (v{})", env!("CARGO_PKG_VERSION"))),
+                        Err(e) => self.notify(e),
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(200)),
+                Err(mpsc::TryRecvError::Disconnected) => self.update_job = None,
+            }
+        }
         if self.sync_open {
             self.sync_panel(&ctx, &pal);
         }
         if self.editor.is_some() {
             self.group_editor(&ctx, &pal);
         }
-        if self.ignore.is_some() {
-            self.ignore_panel(&ctx, &pal);
+        if self.settings.is_some() {
+            self.settings_panel(&ctx, &pal);
+        }
+        if self.help {
+            self.help_overlay(&ctx, &pal);
         }
 
         if let Some(a) = action {
@@ -2504,6 +2608,45 @@ fn dialog_room(ctx: &egui::Context, want: f32) -> (f32, f32) {
     (want.min(screen.width() - 60.0).max(200.0), (screen.height() - 70.0).max(120.0))
 }
 
+/// Keys of a dialog with text fields: (j/k step, Ctrl-S, q/Esc close).
+/// While a field is being edited only Esc is taken (it leaves the field).
+fn dialog_vim_keys(ctx: &egui::Context) -> (isize, bool, bool) {
+    let editing = ctx.egui_wants_keyboard_input();
+    let (nav, save, esc) = ctx.input_mut(|i| {
+        let save = i.consume_key(Modifiers::CTRL, Key::S) || i.consume_key(Modifiers::COMMAND, Key::S);
+        if editing {
+            let leave = i.consume_key(Modifiers::NONE, Key::Escape);
+            return (0, save, leave);
+        }
+        let mut nav = 0;
+        let mut close = i.consume_key(Modifiers::NONE, Key::Escape);
+        for e in &i.events {
+            if let egui::Event::Text(t) = e {
+                for c in t.chars() {
+                    match c {
+                        'j' => nav = 1,
+                        'k' => nav = -1,
+                        'q' => close = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
+        (nav, save, close)
+    });
+    if editing && esc {
+        // Esc in a text field: back to NORMAL, the dialog stays
+        ctx.memory_mut(|m| {
+            if let Some(id) = m.focused() {
+                m.surrender_focus(id);
+            }
+        });
+        return (0, save, false);
+    }
+    (nav, save, esc)
+}
+
 /// One line of text, cut with "…" to fit `max_w`.
 fn elided(p: &egui::Painter, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<egui::Galley> {
     let mut job = LayoutJob::single_section(text.to_string(), TextFormat { font_id: font, color, ..Default::default() });
@@ -2517,7 +2660,7 @@ fn elided(p: &egui::Painter, text: &str, font: FontId, color: Color32, max_w: f3
 fn dialog_frame(pal: &Palette) -> egui::Frame {
     egui::Frame::new()
         .fill(pal.surface)
-        .corner_radius(14)
+        .corner_radius(2)
         .stroke(Stroke::new(1.0, pal.border))
         .inner_margin(Margin::same(18))
         .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(60) })
@@ -2541,7 +2684,7 @@ fn bar_button(ui: &mut egui::Ui, pal: &Palette, label: &str, key: &str, strong: 
     let key_w = ui.painter().layout_no_wrap(key.to_string(), FontId::proportional(11.0), pal.dim).size().x + 10.0;
     let (r, resp) = ui.allocate_exact_size(Vec2::new(text_w + key_w + 22.0, 26.0), Sense::click());
     if resp.hovered() {
-        ui.painter().rect_filled(r, 6, pal.hover);
+        ui.painter().rect_filled(r, 0, pal.hover);
     }
     ui.painter().text(r.left_center() + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, label, font, if strong { pal.text } else { pal.dim });
     paint_keycap(ui.painter(), pal, r.right_center() - Vec2::new(6.0, 0.0), key);
@@ -2571,12 +2714,14 @@ fn power_button(ui: &mut egui::Ui, pal: &Palette) -> egui::Response {
 }
 
 /// Small rounded key label, right-aligned at `right_center`.
-fn paint_keycap(p: &egui::Painter, pal: &Palette, right_center: Pos2, key: &str) {
+/// Returns the keycap's width.
+fn paint_keycap(p: &egui::Painter, pal: &Palette, right_center: Pos2, key: &str) -> f32 {
     let g = p.layout_no_wrap(key.to_string(), FontId::proportional(11.0), pal.dim);
     let size = Vec2::new(g.size().x + 10.0, 20.0);
     let r = Rect::from_min_size(Pos2::new(right_center.x - size.x, right_center.y - size.y / 2.0), size);
-    p.rect_filled(r, 5, if pal.dark { Color32::from_rgba_unmultiplied(255, 255, 255, 18) } else { Color32::from_rgba_unmultiplied(0, 0, 0, 14) });
+    p.rect_stroke(r, 0, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
     p.galley(Pos2::new(r.left() + 5.0, r.center().y - g.size().y / 2.0), g, pal.dim);
+    size.x
 }
 
 #[allow(dead_code)]
@@ -2645,7 +2790,7 @@ fn url_preview(ui: &mut egui::Ui, pal: &Palette, url: &str) {
         ui.add(egui::Label::new(RichText::new(url).font(FontId::monospace(12.0)).color(pal.faint)).wrap().selectable(true));
     });
     ui.add_space(10.0);
-    if ui.add(primary_button(pal, "在浏览器中打开")).clicked() {
+    if ui.add(primary_button(pal, t!("在浏览器中打开", "open in browser"))).clicked() {
         open_external(url);
     }
 }
@@ -2681,7 +2826,7 @@ fn open_external(target: &str) {
 fn one_line(s: &str) -> String {
     let s: String = s.chars().take(300).collect();
     let line = s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-    if line.is_empty() { "(空白)".into() } else { line.replace('\t', "  ") }
+    if line.is_empty() { t!("(空白)", "(blank)").into() } else { line.replace('\t', "  ") }
 }
 
 /// Local time zone offset (seconds east of UTC).
@@ -2729,36 +2874,21 @@ fn abs_time(t: i64, tz: i64) -> String {
     format!("{y}-{mo:02}-{d:02} {h:02}:{mi:02}")
 }
 
-/// Compact time for list accessories: 刚刚 / 5 分钟 / 3 小时 / 昨天 / 4 天 / 11-02.
+/// Compact age, terminal style: now / 5m / 3h / 1d / 4d / 11-02.
 fn short_time(t: i64, tz: i64) -> String {
     let now = now_secs();
     let d = (now - t).max(0);
     let days = (now + tz).div_euclid(86_400) - (t + tz).div_euclid(86_400);
     match (d, days) {
-        (0..=59, _) => "刚刚".into(),
-        (60..=3599, _) => format!("{} 分钟", d / 60),
-        (_, 0) => format!("{} 小时", d / 3600),
-        (_, 1) => "昨天".into(),
-        (_, 2..=6) => format!("{days} 天"),
+        (0..=59, _) => "now".into(),
+        (60..=3599, _) => format!("{}m", d / 60),
+        (_, 0) => format!("{}h", d / 3600),
+        (_, 1..=6) => format!("{days}d"),
         _ => {
             let (y, m, dd, ..) = civil(t, tz);
             let (ny, ..) = civil(now, tz);
             if y == ny { format!("{m:02}-{dd:02}") } else { format!("{y}-{m:02}-{dd:02}") }
         }
-    }
-}
-
-#[allow(dead_code)]
-fn relative_time(t: i64) -> String {
-    let d = (now_secs() - t).max(0);
-    match d {
-        0..=59 => "刚刚".into(),
-        60..=3599 => format!("{} 分钟前", d / 60),
-        3600..=86_399 => format!("{} 小时前", d / 3600),
-        86_400..=172_799 => "昨天".into(),
-        _ if d < 30 * 86_400 => format!("{} 天前", d / 86_400),
-        _ if d < 365 * 86_400 => format!("{} 个月前", d / (30 * 86_400)),
-        _ => format!("{} 年前", d / (365 * 86_400)),
     }
 }
 
@@ -2800,7 +2930,7 @@ mod tests {
         assert_eq!(civil(0, 0), (1970, 1, 1, 0, 0));
         assert_eq!(abs_time(1_795_416_115, 8 * 3600), "2026-11-23 14:41");
         assert_eq!(civil(951_782_400, 0), (2000, 2, 29, 0, 0)); // leap day
-        assert_eq!(short_time(now_secs() - 5, 0), "刚刚");
-        assert_eq!(short_time(now_secs() - 300, 0), "5 分钟");
+        assert_eq!(short_time(now_secs() - 5, 0), "now");
+        assert_eq!(short_time(now_secs() - 300, 0), "5m");
     }
 }

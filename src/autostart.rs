@@ -113,7 +113,7 @@ pub fn ensure_start_menu_shortcut() -> Result<std::path::PathBuf, String> {
         if let Some(parent) = exe.parent() {
             link.SetWorkingDirectory(&HSTRING::from(parent.as_os_str())).map_err(e)?;
         }
-        link.SetDescription(&HSTRING::from("copym 剪贴板历史")).map_err(e)?;
+        link.SetDescription(&HSTRING::from(t!("copym 剪贴板历史", "copym clipboard history"))).map_err(e)?;
         link.SetIconLocation(&HSTRING::from(exe.as_os_str()), 0).map_err(e)?;
         let file: IPersistFile = link.cast().map_err(e)?;
         file.Save(&HSTRING::from(path.as_os_str()), true).map_err(e)?;

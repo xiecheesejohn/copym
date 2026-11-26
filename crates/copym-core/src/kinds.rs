@@ -19,14 +19,14 @@ pub enum TextKind {
 impl TextKind {
     pub fn label(self) -> &'static str {
         match self {
-            TextKind::Plain => "文本",
-            TextKind::Url => "链接",
-            TextKind::Email => "邮箱",
-            TextKind::Path => "路径",
-            TextKind::Color => "颜色",
+            TextKind::Plain => crate::t!("文本", "text"),
+            TextKind::Url => crate::t!("链接", "link"),
+            TextKind::Email => crate::t!("邮箱", "email"),
+            TextKind::Path => crate::t!("路径", "path"),
+            TextKind::Color => crate::t!("颜色", "color"),
             TextKind::Json => "JSON",
-            TextKind::Code => "代码",
-            TextKind::Image => "图片",
+            TextKind::Code => crate::t!("代码", "code"),
+            TextKind::Image => crate::t!("图片", "image"),
         }
     }
 

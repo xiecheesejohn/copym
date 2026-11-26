@@ -59,6 +59,8 @@ pub struct ItemMeta {
     pub hash: u64,
     /// Text recognized in an image (None = not processed yet / not an image).
     pub ocr: Option<String>,
+    /// Pin group the item is in (`GroupDef::board`); 0 = not pinned.
+    pub board: u32,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,6 +86,8 @@ pub struct GroupRule {
     /// None of these may match the content / the source app ("other" groups).
     pub exclude: Vec<String>,
     pub exclude_apps: Vec<String>,
+    /// Only items in this pin group.
+    pub board: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -95,7 +99,12 @@ pub enum Request {
     /// Put the item back on the system clipboard (and move it to the top).
     Activate { id: u64 },
     Delete { id: u64 },
+    /// Pin into the first pin group, or unpin.
     TogglePin { id: u64 },
+    /// Put the item into pin group `board` (0 = unpin).
+    SetPin { id: u64, board: u32 },
+    /// Put the newest item (the current clipboard) into pin group `board`.
+    PinLatest { board: u32 },
     /// Remove every non-pinned item.
     Clear,
     /// `None` toggles.
@@ -111,8 +120,9 @@ pub enum Request {
     /// Join another device's group. `addr` ("ip:port") skips mDNS discovery.
     SyncJoin { code: String, addr: Option<String> },
     SyncLeave,
-    /// List the items of a group (`None` = everything).
-    ListGroup { query: String, regex: bool, group: Option<GroupRule>, limit: u32 },
+    /// One page of a group's items (`None` = everything); `before` is the
+    /// `next` of the previous page. Answered with [`Response::Page`].
+    ListGroup { query: String, regex: bool, group: Option<GroupRule>, before: Option<u64>, limit: u32 },
     /// Number of items in each group for the current search; `None` = invalid rule.
     GroupCounts { query: String, regex: bool, groups: Vec<GroupRule> },
     /// Forget all OCR results and recognize every image again.
@@ -121,6 +131,18 @@ pub enum Request {
     Paste,
     /// Replace `ignore_apps`: saved to config.toml and used right away.
     SetIgnoredApps { apps: Vec<String> },
+    /// Read config.toml again (filters, paste keys; the rest needs a restart).
+    ReloadConfig,
+    /// The newer release found by the background check; `now` checks again first.
+    CheckUpdate { now: bool },
+}
+
+/// A release newer than the running build.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UpdateInfo {
+    pub version: String,
+    /// Release page.
+    pub url: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -146,6 +168,11 @@ pub enum Response {
     Pairing { code: String, addrs: Vec<String>, expires_secs: u64 },
     Joined { name: String },
     Counts(Vec<Option<u32>>),
+    /// `next`: cursor for the following page, `None` = no more items.
+    Page { items: Vec<ItemMeta>, next: Option<u64> },
+    /// Per-group counts; `more` = some are lower bounds (shown as "n+").
+    GroupCounts { counts: Vec<Option<u32>>, more: bool },
+    Update(Option<UpdateInfo>),
     Ok,
     Err(String),
 }
