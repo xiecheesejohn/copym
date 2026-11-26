@@ -182,6 +182,20 @@ fn sync_merge_order_and_tombstones() {
     rm(&p);
 }
 
+/// Every match, following the pages (a scan stops at its time budget and
+/// continues on the next page, so one call may return only part).
+fn all(s: &mut Store, query: &Query) -> usize {
+    let (mut n, mut next) = (0, None);
+    loop {
+        let p = s.list_group(query, None, next, 1000);
+        n += p.items.len();
+        next = p.next;
+        if next.is_none() {
+            return n;
+        }
+    }
+}
+
 fn page(s: &mut Store, query: &str, before: Option<u64>, n: usize) -> (Vec<String>, Option<u64>) {
     let p = s.list_group(&q(query), None, before, n);
     (p.items.into_iter().map(|m| m.preview).collect(), p.next)
@@ -214,14 +228,13 @@ fn paging_and_trigram_search() {
 
     // trigram index: ASCII, CJK, case, multiple terms, source app
     assert_eq!(page(&mut s, "SF000004", None, 50).0, ["订单 4 已发货，快递单号 SF000004"]);
-    assert_eq!(page(&mut s, "快递单号", None, 1000).0.len(), 500);
+    assert_eq!(all(&mut s, &q("快递单号")), 500);
     assert_eq!(page(&mut s, "ROADMAP #1002", None, 50).0, ["Meeting notes #1002: discuss the roadmap"]);
-    assert_eq!(page(&mut s, "example firefox", None, 1000).0.len(), 500);
-    assert_eq!(page(&mut s, "example slack", None, 1000).0.len(), 0);
+    assert_eq!(all(&mut s, &q("example firefox")), 500);
+    assert_eq!(all(&mut s, &q("example slack")), 0);
     // short terms and regexes scan instead
-    assert_eq!(page(&mut s, "单", None, 1000).0.len(), 500);
-    let re = s.list_group(&Query::parse(r"#1\d{3}:", true).unwrap(), None, None, 1000).items;
-    assert_eq!(re.len(), 250);
+    assert_eq!(all(&mut s, &q("单")), 500);
+    assert_eq!(all(&mut s, &Query::parse(r"#1\d{3}:", true).unwrap()), 250);
     // a search pages too
     let (first, next) = page(&mut s, "roadmap", None, 100);
     let (second, _) = page(&mut s, "roadmap", next, 1000);
