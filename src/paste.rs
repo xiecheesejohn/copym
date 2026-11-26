@@ -366,6 +366,62 @@ mod imp {
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
         fn AXIsProcessTrusted() -> bool;
+        fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
+        static kAXTrustedCheckOptionPrompt: *const c_void;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        static kCFBooleanTrue: *const c_void;
+        static kCFTypeDictionaryKeyCallBacks: u8;
+        static kCFTypeDictionaryValueCallBacks: u8;
+        fn CFDictionaryCreate(
+            alloc: *const c_void,
+            keys: *const *const c_void,
+            values: *const *const c_void,
+            n: isize,
+            key_cb: *const u8,
+            value_cb: *const u8,
+        ) -> *const c_void;
+    }
+
+    /// Without the Accessibility permission macOS drops synthetic key
+    /// events. Ask once per run with the system's own dialog (it offers
+    /// "Open System Settings"), never by jumping into the settings ourselves.
+    fn trusted() -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static ASKED: AtomicBool = AtomicBool::new(false);
+        if unsafe { AXIsProcessTrusted() } {
+            return true;
+        }
+        if !ASKED.swap(true, Ordering::SeqCst) {
+            unsafe {
+                let keys = [kAXTrustedCheckOptionPrompt];
+                let values = [kCFBooleanTrue];
+                let opts = CFDictionaryCreate(
+                    std::ptr::null(),
+                    keys.as_ptr(),
+                    values.as_ptr(),
+                    1,
+                    &kCFTypeDictionaryKeyCallBacks,
+                    &kCFTypeDictionaryValueCallBacks,
+                );
+                AXIsProcessTrustedWithOptions(opts);
+                if !opts.is_null() {
+                    CFRelease(opts);
+                }
+            }
+        }
+        false
+    }
+
+    /// Key codes of the modifier keys themselves (left side).
+    fn mod_key(m: Mod) -> (u16, u64) {
+        match m {
+            Mod::Meta => (55, 0x0010_0000),  // kVK_Command
+            Mod::Shift => (56, 0x0002_0000), // kVK_Shift
+            Mod::Alt => (58, 0x0008_0000),   // kVK_Option
+            Mod::Ctrl => (59, 0x0004_0000),  // kVK_Control
+        }
     }
 
     /// ANSI virtual key codes.
@@ -383,27 +439,38 @@ mod imp {
         }
     }
 
+    /// Like CopyQ: modifier down, key down, key up, modifier up, each a real
+    /// event from the combined session state, posted at the HID tap.
     pub fn send(sc: &Shortcut) -> Result<(), String> {
-        if !unsafe { AXIsProcessTrusted() } {
-            let _ = std::process::Command::new("open")
-                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-                .spawn();
-            return Err(t!("需要在「系统设置 › 隐私与安全性 › 辅助功能」中允许 copym 才能自动粘贴", "allow copym in System Settings › Privacy & Security › Accessibility to paste automatically").into());
+        if !trusted() {
+            return Err(t!(
+                "已复制。自动粘贴需要「辅助功能」权限：系统设置 › 隐私与安全性 › 辅助功能 里允许 copym（更新后需先删掉旧的 copym 再重新添加），然后重启 copym",
+                "Copied. Pasting needs the Accessibility permission: allow copym in System Settings › Privacy & Security › Accessibility (after an update remove the old copym entry and add it again), then restart copym"
+            )
+            .into());
         }
-        let mut flags = 0u64;
-        for m in &sc.mods {
-            flags |= match m {
-                Mod::Shift => 0x0002_0000,
-                Mod::Ctrl => 0x0004_0000,
-                Mod::Alt => 0x0008_0000,
-                Mod::Meta => 0x0010_0000,
-            };
-        }
+        let mods: Vec<(u16, u64)> = sc.mods.iter().map(|m| mod_key(*m)).collect();
+        let all: u64 = mods.iter().fold(0, |f, (_, m)| f | m);
         let key = keycode(sc.key);
+        // (key code, down, flags while it is sent)
+        let mut events = Vec::new();
+        let mut flags = 0u64;
+        for (code, mask) in &mods {
+            flags |= mask;
+            events.push((*code, true, flags));
+        }
+        // 0x8 (a device-dependent bit) makes Emacs accept ⌘V (Flycut / CopyQ)
+        let extra = if all & 0x0010_0000 != 0 { 0x8 } else { 0 };
+        events.push((key, true, all | extra));
+        events.push((key, false, all | extra));
+        for (code, mask) in mods.iter().rev() {
+            flags &= !mask;
+            events.push((*code, false, flags));
+        }
         unsafe {
-            let src = CGEventSourceCreate(1); // HID system state
-            for down in [true, false] {
-                let ev = CGEventCreateKeyboardEvent(src, key, down);
+            let src = CGEventSourceCreate(0); // kCGEventSourceStateCombinedSessionState
+            for (code, down, flags) in events {
+                let ev = CGEventCreateKeyboardEvent(src, code, down);
                 if ev.is_null() {
                     continue;
                 }
