@@ -27,10 +27,14 @@ for s in 16 32 128 256 512; do
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/copym.icns"
 
-# Ad-hoc signature (no Apple Developer ID): seals the bundle so macOS
-# accepts it after the user allows it once in Privacy & Security.
-codesign --force --deep --sign - "$APP"
+# Signature. With MACOS_SIGN_IDENTITY (a keychain identity, e.g. the SHA-1
+# of the self-signed "copym Code Signing" certificate that CI imports) the
+# designated requirement is "this bundle id + this certificate", so the
+# Accessibility permission survives updates. Without it: an ad-hoc
+# signature, which macOS ties to this exact build (re-allow after updates).
+codesign --force --deep --sign "${MACOS_SIGN_IDENTITY:--}" --identifier io.github.xiecheesejohn.copym "$APP"
 codesign --verify --deep --strict "$APP"
+codesign --display --requirements - "$APP" 2>&1 | grep designated || true
 
 ln -s /Applications "$WORK/dmg/Applications"
 rm -f "$OUT"

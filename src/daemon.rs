@@ -676,7 +676,7 @@ pub fn ensure_running() -> Result<(), String> {
     if ipc::Client::connect().is_ok() {
         return Ok(());
     }
-    spawn_detached("daemon")?;
+    start_daemon()?;
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(60));
         if ipc::Client::connect().is_ok() {
@@ -684,6 +684,39 @@ pub fn ensure_running() -> Result<(), String> {
         }
     }
     Err(format!("daemon did not start, see {}", config::log_path().display()))
+}
+
+/// The `.app` bundle this program runs from, if any.
+#[cfg(target_os = "macos")]
+fn app_bundle() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    exe.ancestors().find(|p| p.extension().is_some_and(|e| e == "app")).map(|p| p.to_path_buf())
+}
+
+/// Start `copym daemon` in the background.
+///
+/// On macOS it goes through Launch Services (`open`) when we run from the
+/// app bundle: privacy permissions (Accessibility, for pasting) belong to the
+/// app that started a process chain, so a daemon started from a terminal
+/// would need Terminal to have the permission instead of copym.
+fn start_daemon() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    if let Some(app) = app_bundle() {
+        let mut cmd = Command::new("/usr/bin/open");
+        // -n: a new instance even while one runs (the popup, `copym restart`)
+        // -g: stay in the background
+        cmd.arg("-n").arg("-g").arg("--stderr").arg(config::log_path());
+        for (k, v) in std::env::vars().filter(|(k, _)| k.starts_with("COPYM_")) {
+            cmd.arg("--env").arg(format!("{k}={v}"));
+        }
+        cmd.arg(&app).arg("--args").arg("daemon").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let status = cmd.status().map_err(|e| e.to_string())?;
+        if status.success() {
+            return Ok(());
+        }
+        eprintln!("copym: open {} failed ({status}), starting directly", app.display());
+    }
+    spawn_detached("daemon")
 }
 
 /// Run `copym <arg>` in the background, detached from this process (it

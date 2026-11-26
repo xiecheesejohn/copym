@@ -43,6 +43,33 @@ jobs:
       - run: cargo build --release --target ${{ matrix.target }}
       # File names carry version, OS and architecture (copym-0.1.0-linux-x86_64.tar.gz);
       # the program inside keeps its plain name, so autostart entries survive upgrades.
+      # Sign the Mac app with the project's self-signed certificate (secrets
+      # MACOS_CERT_P12 = base64 of the .p12, MACOS_CERT_PASSWORD), so macOS
+      # keeps the Accessibility permission across updates. Forks without the
+      # secrets fall back to an ad-hoc signature.
+      - name: Import the signing certificate
+        if: runner.os == 'macOS'
+        env:
+          P12: ${{ secrets.MACOS_CERT_P12 }}
+          PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          if [ -z "$P12" ]; then echo "no certificate: ad-hoc signature"; exit 0; fi
+          kc="$RUNNER_TEMP/sign.keychain-db"
+          kcpass=$(uuidgen)
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/sign.p12"
+          security create-keychain -p "$kcpass" "$kc"
+          security set-keychain-settings -lut 3600 "$kc"
+          security unlock-keychain -p "$kcpass" "$kc"
+          security import "$RUNNER_TEMP/sign.p12" -k "$kc" -P "$PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kcpass" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/sign.p12"
+          # self-signed: trust it for code signing on this runner only
+          security find-certificate -c "copym Code Signing" -p "$kc" > "$RUNNER_TEMP/sign.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/sign.pem"
+          id=$(security find-certificate -c "copym Code Signing" -Z "$kc" | awk '/SHA-1/ {print $3}')
+          echo "MACOS_SIGN_IDENTITY=$id" >> "$GITHUB_ENV"
+          security find-identity -p codesigning "$kc"
       - name: Package
         shell: bash
         run: |
@@ -67,6 +94,11 @@ jobs:
           file /tmp/copym-dmg/copym.app/Contents/MacOS/copym
           /tmp/copym-dmg/copym.app/Contents/MacOS/copym version
           codesign --verify --deep --strict /tmp/copym-dmg/copym.app
+          codesign --display --verbose=2 --requirements - /tmp/copym-dmg/copym.app 2>&1 | grep -E 'Authority|Identifier|designated'
+          if [ -n "${MACOS_SIGN_IDENTITY:-}" ]; then
+            codesign --display --requirements - /tmp/copym-dmg/copym.app 2>&1 | grep -qE 'certificate (root|leaf)' \
+              || { echo "::error::the app is not signed with the copym certificate"; exit 1; }
+          fi
           hdiutil detach /tmp/copym-dmg
       - name: Chinese OCR (built-in PP-OCR)
         if: runner.os == 'Linux'

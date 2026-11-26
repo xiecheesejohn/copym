@@ -119,7 +119,8 @@ copym pin ID            # 固定 / 取消固定
 按 `Enter` 后弹窗先关闭，焦点回到之前的窗口，再模拟一次粘贴快捷键（默认 `Ctrl+V`，macOS `⌘V`，可用 `paste_shortcut` 改成 `shift+insert`、`ctrl+shift+v` 等，例如终端里常用后者）。
 
 - **Windows**：`SendInput`，无需额外设置。
-- **macOS**：第一次使用时需要在“系统设置 → 隐私与安全性 → 辅助功能”里允许 copym。
+- **macOS**：第一次使用时需要在“系统设置 → 隐私与安全性 → 辅助功能”里允许 copym。安装包用项目自己的证书签名（自签名，"copym Code Signing"），从 0.2.2 起升级后不用重新授权；从 0.2.1 及更早版本升级时，先在列表里用“−”删掉旧的 copym，再重新允许一次。
+  - 从终端运行 `copym` 命令也没问题：守护进程会通过 `open` 以 copym.app 的身份启动，权限算在 copym 上，而不是终端上。
 - **Linux X11**：XTEST，无需额外设置。
 - **Linux Wayland**：通过 `/dev/uinput` 虚拟键盘（当前用户需要有写权限，许多发行版的游戏手柄 / 远程桌面软件包会配好；或者自行添加 udev 规则），否则尝试 `wtype`、`ydotool`。都不可用时内容仍在剪贴板里，下次打开弹窗会提示原因。
 

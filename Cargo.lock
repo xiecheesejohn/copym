@@ -669,7 +669,7 @@ checksum = "be95d4a884358a21a199689323c29e9256b4a1b315e22f183d155422041d3a9a"
 
 [[package]]
 name = "copym"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "arboard",
  "copym-core",
@@ -709,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "copym-android"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "copym-core",
  "copym-sync",
@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "copym-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "lz4_flex",
  "png",
@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "copym-sync"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "copym-core",
  "getrandom 0.4.3",
