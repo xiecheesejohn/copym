@@ -637,7 +637,12 @@ mod tests {
         app.error = None;
         app.settings = Some(Settings::new(&app.cfg, false));
         let mut fonts_ready = false;
-        let mut harness = Harness::builder().with_size(Vec2::new(760.0, 480.0)).with_accessibility_check(false).build_ui_state(
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(760.0, 480.0))
+            .with_accessibility_check(false)
+            // CI runners may lack CJK fonts: the tests check keys, not glyphs
+            .allow_missing_glyphs()
+            .build_ui_state(
             move |ui, app: &mut App| {
                 // fonts apply from the next frame: draw nothing until then
                 if !fonts_ready {
