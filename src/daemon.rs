@@ -676,6 +676,19 @@ pub fn ensure_running() -> Result<(), String> {
     if ipc::Client::connect().is_ok() {
         return Ok(());
     }
+    spawn_detached("daemon")?;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        if ipc::Client::connect().is_ok() {
+            return Ok(());
+        }
+    }
+    Err(format!("daemon did not start, see {}", config::log_path().display()))
+}
+
+/// Run `copym <arg>` in the background, detached from this process (it
+/// outlives us: `restart` stops the daemon that the popup belongs to).
+pub fn spawn_detached(arg: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -684,7 +697,7 @@ pub fn ensure_running() -> Result<(), String> {
         .map(Stdio::from)
         .unwrap_or_else(|_| Stdio::null());
     let mut cmd = Command::new(exe);
-    cmd.arg("daemon").stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
+    cmd.arg(arg).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -697,14 +710,7 @@ pub fn ensure_running() -> Result<(), String> {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
-    cmd.spawn().map_err(|e| e.to_string())?;
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        if ipc::Client::connect().is_ok() {
-            return Ok(());
-        }
-    }
-    Err(format!("daemon did not start, see {}", config::log_path().display()))
+    cmd.spawn().map(drop).map_err(|e| e.to_string())
 }
 
 /// Bridges the sync engine to the local history. Received items only go into

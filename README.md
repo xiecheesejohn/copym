@@ -95,12 +95,13 @@ copym pin ID            # 固定 / 取消固定
 | 命令 | 作用 |
 |---|---|
 | `:q` / `:q!` `:qa` | 关闭弹窗 / 退出 copym |
+| `:restart` | 重启 copym（改了设置或全局快捷键后；右下角的电源按钮里也有：关闭弹窗 / 重启 / 退出） |
 | `:12` | 跳到第 12 条 |
 | `:set bg=dark` `light` `system`（或 `:colo dark`） | 外观 |
 | `:set lang=zh` `en` `auto` | 界面语言 |
 | `:set regex` / `:set noregex` | 正则搜索 |
 | `:g 2` / `:g 链接` / `:bn` `:bp` | 切换分组 |
-| `:settings` `:sync` `:groups` `:pause` `:resume` `:update` `:help` | 打开对应界面 / 执行 |
+| `:settings` `:sync` `:groups` `:pause` `:resume` `:update` `:help` | 打开对应界面 / 执行（`?` 或 `:help` 列出全部按键和命令，`j` `k` 滚动） |
 | `:y` `:p` `:d` `:pin` / `:noh` | 复制、粘贴、删除、固定当前条目 / 清空搜索 |
 
 对话框里同样是 Vim 键：设置（`Ctrl+,`、`:settings` 或菜单里的 `,`）用 `j` `k` 选行、`h` `l` 改值、`Space` 切换开关、`i` 编辑文本、`Tab` / `gt` 切换分类、`Ctrl-S` 保存、`ZZ` 保存并关闭、`q` / `Esc` 关闭；管理分组用 `j` `k` 切换分组、`Ctrl-S` 保存。文本框里按 `Esc` 只退出编辑。

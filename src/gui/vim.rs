@@ -48,13 +48,41 @@ impl App {
             return None; // dialogs own the keyboard
         }
         if self.help {
+            const LINE: f32 = 20.0;
+            let mut scroll = self.help_scroll;
             let close = ctx.input_mut(|i| {
-                let text = i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "q" || t == "?"));
+                let mut close = false;
+                for e in &i.events {
+                    if let egui::Event::Text(t) = e {
+                        match t.as_str() {
+                            "q" | "?" => close = true,
+                            "j" => scroll += LINE,
+                            "k" => scroll -= LINE,
+                            "g" => scroll = 0.0,
+                            "G" => scroll = f32::MAX / 2.0, // clamped by the scroll area
+                            _ => {}
+                        }
+                    }
+                }
                 i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
-                i.consume_key(Modifiers::NONE, Key::Escape) || i.consume_key(Modifiers::NONE, Key::Enter) || text
+                if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                    scroll += LINE;
+                }
+                if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                    scroll -= LINE;
+                }
+                if i.consume_key(Modifiers::CTRL, Key::D) || i.consume_key(Modifiers::NONE, Key::PageDown) || i.consume_key(Modifiers::NONE, Key::Space) {
+                    scroll += LINE * 10.0;
+                }
+                if i.consume_key(Modifiers::CTRL, Key::U) || i.consume_key(Modifiers::NONE, Key::PageUp) {
+                    scroll -= LINE * 10.0;
+                }
+                close || i.consume_key(Modifiers::NONE, Key::Escape) || i.consume_key(Modifiers::NONE, Key::Enter)
             });
+            self.help_scroll = scroll.max(0.0);
             if close {
                 self.help = false;
+                self.help_scroll = 0.0;
             }
             return None;
         }
@@ -446,6 +474,7 @@ impl App {
             "" => {}
             "q" | "quit" | "x" | "wq" | "close" | "clo" => self.close(ctx),
             "q!" | "qa" | "qa!" | "qall" | "quit!" | "qall!" => self.pending_quit = true,
+            "restart" | "reload" => self.pending_restart = true,
             "set" | "se" => self.set_option(arg),
             "colo" | "colorscheme" | "theme" => self.set_option(&format!("bg={arg}")),
             "lang" | "language" => self.set_option(&format!("lang={arg}")),
@@ -569,27 +598,55 @@ impl App {
             ("^u ^w", t!("搜索时清空 / 删除一个词", "while searching: clear / delete word")),
             ("gt gT  Tab", t!("下一个 / 上一个分组", "next / previous group")),
             ("Space", t!("操作菜单（字母直接执行）", "action menu (letters run actions)")),
-            (":", t!("命令：:q :q! :5 :set bg=dark :set lang=en", "commands: :q :q! :5 :set bg=dark :set lang=en")),
-            (":", t!("     :settings :sync :groups :pause :g 2", "     :settings :sync :groups :pause :g 2")),
             ("Esc  q  ZZ", t!("关闭（Esc 先清除计数和搜索）", "close (Esc clears count and search first)")),
             ("?", t!("这份帮助", "this help")),
+        ];
+        let commands: Vec<(&str, &str)> = vec![
+            (":q", t!("关闭弹窗", "close the popup")),
+            (":q!  :qa", t!("退出 copym", "quit copym")),
+            (":restart", t!("重启 copym（改了设置或快捷键后）", "restart copym (after changing settings or hotkeys)")),
+            (":12", t!("跳到第 12 条", "go to item 12")),
+            (":y  :p  :d", t!("复制 / 粘贴 / 删除当前条目", "yank / paste / delete the item")),
+            (":pin [x]", t!("固定到分组 x（按键、名字或编号；省略为默认）", "pin to group x (key, name or number; default when omitted)")),
+            (":unpin", t!("取消固定", "unpin")),
+            (":g 2  :g 名字", t!("切换到第 2 个 / 指定名字的分组", "go to group 2 / by name")),
+            (":bn  :bp", t!("下一个 / 上一个分组", "next / previous group")),
+            (":groups", t!("管理分组", "manage groups")),
+            (":noh", t!("清除搜索", "clear the search")),
+            (":regex  :noregex", t!("正则搜索开 / 关", "regex search on / off")),
+            (":set bg=dark|light|system", t!("主题（也可 :colo dark）", "theme (or :colo dark)")),
+            (":set lang=zh|en|auto", t!("界面语言（也可 :lang en）", "language (or :lang en)")),
+            (":set  :settings", t!("打开设置", "open the settings")),
+            (":sync", t!("局域网同步", "LAN sync")),
+            (":pause  :resume", t!("暂停 / 恢复记录", "pause / resume recording")),
+            (":update", t!("检查更新", "check for updates")),
+            (":help", t!("这份帮助", "this help")),
         ];
         egui::Modal::new(egui::Id::unique("help")).frame(dialog_frame(pal).inner_margin(Margin::same(14))).show(ctx, |ui| {
             let (w, h) = dialog_room(ctx, 600.0);
             ui.set_width(w);
             ui.label(RichText::new(t!("-- 键盘 --", "-- KEYS --")).size(12.5).strong().color(pal.accent));
             ui.add_space(4.0);
-            egui::ScrollArea::vertical().max_height(h - 70.0).show(ui, |ui| {
-                egui::Grid::new("help-keys").num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
-                    for (k, d) in rows {
-                        ui.label(RichText::new(k).size(11.5).color(pal.accent));
-                        ui.label(RichText::new(d).size(11.5).color(pal.text));
-                        ui.end_row();
-                    }
-                });
+            let out = egui::ScrollArea::vertical().max_height(h - 70.0).vertical_scroll_offset(self.help_scroll).show(ui, |ui| {
+                let table = |ui: &mut egui::Ui, id: &str, rows: Vec<(&str, &str)>| {
+                    egui::Grid::new(id).num_columns(2).min_col_width(150.0).spacing([16.0, 2.0]).show(ui, |ui| {
+                        for (k, d) in rows {
+                            ui.label(RichText::new(k).size(11.5).color(pal.accent));
+                            ui.label(RichText::new(d).size(11.5).color(pal.text));
+                            ui.end_row();
+                        }
+                    });
+                };
+                table(ui, "help-keys", rows);
+                ui.add_space(10.0);
+                ui.label(RichText::new(t!("-- 命令 --", "-- COMMANDS --")).size(12.5).strong().color(pal.accent));
+                ui.add_space(4.0);
+                table(ui, "help-commands", commands);
             });
+            // keep what the wheel / scrollbar did, clamped to the content
+            self.help_scroll = out.state.clamped_offset().y;
             ui.add_space(6.0);
-            ui.label(RichText::new(t!("按 Esc / q / ? 关闭", "Esc / q / ? to close")).size(11.5).color(pal.faint));
+            ui.label(RichText::new(t!("j/k 滚动  g/G 顶部/底部  按 Esc / q / ? 关闭", "j/k scroll  g/G top/bottom  Esc / q / ? to close")).size(11.5).color(pal.faint));
         });
     }
 }

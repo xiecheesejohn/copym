@@ -621,6 +621,7 @@ struct App {
     pending_activate: Option<bool>,
     /// Quit button clicked.
     pending_quit: bool,
+    pending_restart: bool,
     /// Local time zone offset in seconds.
     tz: i64,
     frames: u64,
@@ -632,6 +633,8 @@ struct App {
     pending: String,
     /// Key help (`?`).
     help: bool,
+    /// Scroll offset of the help page (j/k move it).
+    help_scroll: f32,
     /// Set by the popup host when the hotkey asks the window to close.
     close_req: Arc<AtomicBool>,
     after: Arc<Mutex<AfterClose>>,
@@ -665,6 +668,7 @@ enum Act {
     CheckUpdate,
     OpenUpdate(String),
     Settings,
+    Restart,
     Quit,
 }
 
@@ -780,12 +784,14 @@ impl App {
             actions: None,
             pending_activate: None,
             pending_quit: false,
+            pending_restart: false,
             tz: local_offset(),
             frames: 0,
             search_mode: false,
             cmdline: None,
             pending: String::new(),
             help: false,
+            help_scroll: 0.0,
             close_req,
             after,
             resident: None,
@@ -1081,6 +1087,15 @@ impl App {
         ctx.send_viewport_cmd(ViewportCommand::Close);
     }
 
+    /// Restart copym (daemon and popup) to apply settings and hotkeys: a
+    /// detached `copym restart` stops this daemon and starts a new one.
+    fn restart(&mut self) {
+        match crate::daemon::spawn_detached("restart") {
+            Ok(()) => self.notify(t!("正在重启 copym…", "restarting copym…")),
+            Err(e) => self.notify(tf!("重启失败：{e}", "restart failed: {e}")),
+        }
+    }
+
     /// Rows of the action panel for the selected item.
     /// Rows of the action menu. The key column is the row's letter: pressing
     /// it runs the row (which-key style); j/k/⏎ work too.
@@ -1141,6 +1156,7 @@ impl App {
             Some(u) => rows.push(act(Act::OpenUpdate(u.url.clone()), ic::DOWNLOAD, tf!("下载新版本 {}", "download version {}", u.version), "u")),
             None => rows.push(act(Act::CheckUpdate, ic::REFRESH_CW, tf!("检查更新（v{}）", "check for updates (v{})", env!("CARGO_PKG_VERSION")), "u")),
         }
+        rows.push(act(Act::Restart, ic::REFRESH_CW, t!("重启 copym", "restart copym").into(), "R"));
         rows.push(act(Act::Quit, ic::LOG_OUT, t!("退出 copym", "quit copym").into(), "Q"));
         rows
     }
@@ -1215,6 +1231,7 @@ impl App {
             Act::Paste => return Some(Action::Activate(self.selected, true)),
             Act::Copy => return Some(Action::Activate(self.selected, false)),
             Act::Quit => self.pending_quit = true,
+            Act::Restart => self.pending_restart = true,
             Act::Pin => return Some(Action::Pin(self.selected)),
             Act::PinTo(0) => {
                 let current = self.items.get(self.selected).map(|m| m.board).unwrap_or(0);
@@ -2222,13 +2239,35 @@ impl App {
         let mut open_actions = false;
         let mut copy = false;
         let mut quit = false;
+        let mut restart = false;
+        let mut close = false;
         let mut help = false;
         let mut open_url = None;
         let buttons = ui.scope_builder(egui::UiBuilder::new().max_rect(inner).layout(Layout::right_to_left(Align::Center)), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            if power_button(ui, pal).on_hover_text(t!("退出 copym（:q!）", "quit copym (:q!)")).clicked() {
-                quit = true;
-            }
+            let power = power_button(ui, pal).on_hover_text(t!("关闭 / 重启 / 退出", "close / restart / quit"));
+            egui::Popup::menu(&power).show(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let entries = [
+                    (crate::icons::X, t!("关闭弹窗", "close popup"), "Esc  :q", &mut close),
+                    (crate::icons::REFRESH_CW, t!("重启 copym", "restart copym"), ":restart", &mut restart),
+                    (crate::icons::LOG_OUT, t!("退出 copym", "quit copym"), ":q!", &mut quit),
+                ];
+                for (icon, label, key, flag) in entries {
+                    let (row, resp) = ui.allocate_exact_size(Vec2::new(200.0, 28.0), Sense::click());
+                    let p = ui.painter();
+                    if resp.hovered() {
+                        p.rect_filled(row, 6, pal.hover);
+                    }
+                    p.text(row.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, icon, icon_font(14.0), pal.dim);
+                    p.text(row.left_center() + Vec2::new(32.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(13.0), pal.text);
+                    p.text(row.right_center() - Vec2::new(10.0, 0.0), Align2::RIGHT_CENTER, key, FontId::proportional(11.5), pal.faint);
+                    if resp.clicked() {
+                        *flag = true;
+                        ui.close();
+                    }
+                }
+            });
             if bar_button(ui, pal, t!("帮助", "help"), "?", false).clicked() {
                 help = true;
             }
@@ -2304,6 +2343,12 @@ impl App {
         }
         if quit {
             self.pending_quit = true;
+        }
+        if restart {
+            self.pending_restart = true;
+        }
+        if close {
+            self.close(&ui.ctx().clone());
         }
         if help {
             self.help = true;
@@ -2533,6 +2578,9 @@ impl App {
         }
         if std::mem::take(&mut self.pending_quit) {
             self.quit(&ctx);
+        }
+        if std::mem::take(&mut self.pending_restart) {
+            self.restart();
         }
 
         // transient notice (e.g. "saved")

@@ -73,7 +73,15 @@ pub struct Config {
     pub sync_history_items: usize,
     /// Extra peers to connect to when mDNS is blocked, e.g. ["192.168.1.20:47800"].
     pub sync_peers: Vec<String>,
+    /// Format of the file; older files are upgraded once on load (missing = 0).
+    #[serde(default)]
+    pub config_version: u32,
 }
+
+/// Current `config_version`.
+const CONFIG_VERSION: u32 = 2;
+/// Default `max_items` up to config version 1 (written into every file then).
+const OLD_DEFAULT_MAX_ITEMS: usize = 500;
 
 impl Default for Config {
     fn default() -> Self {
@@ -120,11 +128,14 @@ impl Default for Config {
             sync_max_image_bytes: 8 * 1024 * 1024,
             sync_history_items: 200,
             sync_peers: Vec::new(),
+            config_version: CONFIG_VERSION,
         }
     }
 }
 
-const TEMPLATE_HEADER: &str = "# copym configuration. Delete a line to fall back to its default.\n\
+const TEMPLATE_HEADER: &str = "# copym configuration (also editable in the popup: Ctrl+, or :settings).\n\
+# The commented lines show the defaults: remove the # and change the value to\n\
+# override one. Lines left commented follow the defaults of newer versions.\n\
 # ignore_patterns example: ignore_patterns = ['^\\d{6}$', '(?i)password']\n\n";
 
 impl Config {
@@ -138,17 +149,35 @@ impl Config {
     pub fn load() -> Self {
         let path = config_path();
         match std::fs::read_to_string(&path) {
-            Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
-                eprintln!("copym: invalid {}: {e}; using defaults", path.display());
-                Config::default()
-            }),
+            Ok(s) => match toml::from_str::<Config>(&s) {
+                Ok(mut cfg) => {
+                    let changes = cfg.upgrade();
+                    if !changes.is_empty() {
+                        if let Err(e) = save_values(&changes.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>()) {
+                            eprintln!("copym: {e}");
+                        }
+                    }
+                    cfg
+                }
+                Err(e) => {
+                    eprintln!("copym: invalid {}: {e}; using defaults", path.display());
+                    Config::default()
+                }
+            },
             Err(_) => {
                 let cfg = Config::default();
                 if let Some(dir) = path.parent() {
                     let _ = std::fs::create_dir_all(dir);
                 }
+                // only the version is set; the defaults are listed as comments,
+                // so later versions can change them
                 if let Ok(body) = toml::to_string_pretty(&cfg) {
-                    let _ = std::fs::write(&path, format!("{TEMPLATE_HEADER}{body}"));
+                    let commented: String = body
+                        .lines()
+                        .filter(|l| !l.starts_with("config_version"))
+                        .map(|l| if l.trim().is_empty() { "\n".to_string() } else { format!("# {l}\n") })
+                        .collect();
+                    let _ = std::fs::write(&path, format!("{TEMPLATE_HEADER}config_version = {CONFIG_VERSION}\n\n{commented}"));
                 }
                 cfg
             }
@@ -212,6 +241,24 @@ pub const RESTART_KEYS: &[&str] = &[
 
 impl Config {
     /// Every setting as a TOML value, by key.
+    /// Bring a file written by an older version up to date. Returns the keys
+    /// to write back (empty when nothing changed).
+    fn upgrade(&mut self) -> Vec<(&'static str, toml_edit::Value)> {
+        if self.config_version >= CONFIG_VERSION {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        // Version 1 wrote every default into the file, so the old limit of 500
+        // stuck even after the default became 100 000.
+        if self.max_items == OLD_DEFAULT_MAX_ITEMS {
+            self.max_items = Config::default().max_items;
+            out.push(("max_items", toml_edit::Value::from(self.max_items as i64)));
+        }
+        self.config_version = CONFIG_VERSION;
+        out.push(("config_version", toml_edit::Value::from(CONFIG_VERSION as i64)));
+        out
+    }
+
     pub fn values(&self) -> Vec<(String, toml_edit::Value)> {
         let text = toml::to_string(self).unwrap_or_default();
         let doc: toml_edit::DocumentMut = text.parse().unwrap_or_default();
@@ -323,6 +370,24 @@ mod tests {
         let cfg: Config = toml::from_str(&with_values("", &[("ignore_apps", list_value(&[]))]).unwrap()).unwrap();
         assert!(cfg.ignore_apps.is_empty());
         assert!(with_values("not = = toml", &[]).is_err());
+    }
+
+    #[test]
+    fn upgrade_old_files_once() {
+        // a version-1 file: every default written out, no version
+        let mut old: Config = toml::from_str("max_items = 500\ntheme = \"dark\"").unwrap();
+        assert_eq!(old.config_version, 0);
+        let keys: Vec<&str> = old.upgrade().iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, ["max_items", "config_version"]);
+        assert_eq!((old.max_items, old.theme.as_str()), (100_000, "dark"));
+        // done once: 500 chosen afterwards stays
+        let mut new: Config = toml::from_str("config_version = 2\nmax_items = 500").unwrap();
+        assert!(new.upgrade().is_empty());
+        assert_eq!(new.max_items, 500);
+        // a custom limit survives the upgrade
+        let mut custom: Config = toml::from_str("max_items = 2000").unwrap();
+        assert_eq!(custom.upgrade().len(), 1);
+        assert_eq!(custom.max_items, 2000);
     }
 
     #[test]

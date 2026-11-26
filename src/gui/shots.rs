@@ -47,7 +47,12 @@ fn app(theme: &str, lang: Lang) -> App {
     app
 }
 
-fn shoot(name: &str, mut app: App, size: Vec2, prepare: impl FnOnce(&mut App)) {
+fn shoot(name: &str, app: App, size: Vec2, prepare: impl FnOnce(&mut App)) {
+    shoot_click(name, app, size, prepare, None)
+}
+
+/// Like [`shoot`], clicking at `click` (points) once the UI is up.
+fn shoot_click(name: &str, mut app: App, size: Vec2, prepare: impl FnOnce(&mut App), click: Option<Pos2>) {
     let Some(dir) = std::env::var_os("COPYM_SHOTS") else { return };
     prepare(&mut app);
     let mut fonts_ready = false;
@@ -65,6 +70,15 @@ fn shoot(name: &str, mut app: App, size: Vec2, prepare: impl FnOnce(&mut App)) {
     );
     for _ in 0..6 {
         harness.step();
+    }
+    if let Some(pos) = click {
+        harness.hover_at(pos);
+        harness.step();
+        harness.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+        harness.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+        for _ in 0..4 {
+            harness.step();
+        }
     }
     let image = harness.render().expect("render");
     let path = std::path::Path::new(&dir).join(format!("{name}.png"));
@@ -88,6 +102,12 @@ fn shots() {
             });
             shoot(&format!("command-{t}-{l}"), app(theme, lang), WINDOW, |a| a.cmdline = Some("set bg=light".into()));
             shoot(&format!("help-{t}-{l}"), app(theme, lang), WINDOW, |a| a.help = true);
+            shoot(&format!("help-commands-{t}-{l}"), app(theme, lang), WINDOW, |a| {
+                a.help = true;
+                a.help_scroll = 1000.0;
+            });
+            let power = Pos2::new(WINDOW.x - 10.0 - 13.0, WINDOW.y - FOOTER_H / 2.0);
+            shoot_click(&format!("power-{t}-{l}"), app(theme, lang), WINDOW, |_| {}, Some(power));
             // several pin groups: sections per group, 'key markers, which-key after m
             let boards = |a: &mut App| {
                 use crate::groups::GroupDef;
