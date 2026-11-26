@@ -48,8 +48,8 @@ pub struct Config {
     pub theme: String,
     /// "auto" (system language), "zh" or "en".
     pub language: String,
-    /// UI font file (.ttf / .otf / .ttc; "~/" allowed). Empty = the system UI
-    /// font (PingFang SC, Microsoft YaHei UI, or fontconfig's sans-serif).
+    /// UI font file (.ttf / .otf / .ttc; "~/" allowed). Empty = the bundled
+    /// Maple Mono NF CN (it stays as fallback for a custom font).
     pub font: String,
     /// Recognize text in images so they can be searched.
     pub ocr_enabled: bool,

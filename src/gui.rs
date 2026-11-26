@@ -321,6 +321,23 @@ static SYMBOLS_FONT: &[u8] = include_bytes!("../assets/fonts/copym-symbols.ttf")
 /// Lucide icons (ISC license, see assets/fonts), drawn with `icon()`.
 static ICONS_FONT: &[u8] = include_bytes!("../assets/fonts/copym-icons.ttf");
 
+/// Maple Mono NF CN Regular (OFL-1.1, see assets/fonts), zstd-compressed:
+/// monospace Latin, CJK and Nerd Font icons, the same on every platform.
+static MAIN_FONT_ZST: &[u8] = include_bytes!("../assets/fonts/maple-mono-nf-cn.ttf.zst");
+
+/// The bundled main font, decompressed once per process.
+fn main_font() -> Option<Arc<FontData>> {
+    static FONT: std::sync::OnceLock<Option<Arc<FontData>>> = std::sync::OnceLock::new();
+    FONT.get_or_init(|| {
+        use std::io::Read;
+        let mut bytes = Vec::with_capacity(21 << 20);
+        let mut dec = ruzstd::decoding::StreamingDecoder::new(MAIN_FONT_ZST).ok()?;
+        dec.read_to_end(&mut bytes).ok()?;
+        Some(Arc::new(FontData::from_owned(bytes)))
+    })
+    .clone()
+}
+
 fn icon_font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("icons".into()))
 }
@@ -331,8 +348,9 @@ fn icon_font(size: f32) -> FontId {
 /// egui's bundled fonts stay as fallback (they have no CJK glyphs).
 fn install_fonts(ctx: &egui::Context, custom: &str) {
     let mut fonts = FontDefinitions::default();
-    // Terminal look: one monospace face for everything. egui's Hack for
-    // Latin, the system CJK font after it, then emoji and icon fallbacks.
+    // Terminal look: one monospace face for everything. The bundled Maple
+    // Mono (Latin, CJK, Nerd Font icons; egui's Hack if it cannot load), the
+    // system CJK font for what it lacks, then emoji and icon fallbacks.
     let mono = fonts.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
     let mut family = Vec::new();
     if let Some((bytes, index)) = custom_font(custom) {
@@ -341,7 +359,13 @@ fn install_fonts(ctx: &egui::Context, custom: &str) {
         fonts.font_data.insert("custom".into(), Arc::new(data));
         family.push("custom".to_string());
     }
-    family.extend(mono.first().cloned());
+    match main_font() {
+        Some(data) => {
+            fonts.font_data.insert("maple-mono".into(), data);
+            family.push("maple-mono".into());
+        }
+        None => family.extend(mono.first().cloned()),
+    }
     if let Some((bytes, index)) = find_ui_font("") {
         let mut data = FontData::from_owned(bytes);
         data.index = index;
@@ -2020,7 +2044,7 @@ impl App {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            if ui.small_button(t!("＋ 新建", "+ new")).clicked() {
+                            if ui.small_button(t!("+ 新建", "+ new")).clicked() {
                                 ed.store_bufs();
                                 let n = ed.draft.list.len() + 1;
                                 ed.draft.list.push(GroupDef { name: tf!("分组 {n}", "group {n}"), ..Default::default() });
@@ -2271,7 +2295,7 @@ impl App {
             if bar_button(ui, pal, t!("帮助", "help"), "?", false).clicked() {
                 help = true;
             }
-            if bar_button(ui, pal, t!("菜单", "menu"), "␣", false).clicked() {
+            if bar_button(ui, pal, t!("菜单", "menu"), "\u{f1050}", false).clicked() {
                 open_actions = true;
             }
             let label = if self.cfg.paste_on_enter { t!("粘贴", "paste") } else { t!("复制", "yank") };
@@ -2955,6 +2979,28 @@ fn human_size(b: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every non-ASCII character in the UI's strings has a glyph in the
+    /// bundled fonts, so no platform falls back to the system font (or boxes).
+    #[test]
+    fn bundled_fonts_cover_the_ui() {
+        use skrifa::MetadataProvider;
+        let t = std::time::Instant::now();
+        let main = main_font().expect("bundled font decodes");
+        eprintln!("decompressed {} bytes in {:?}", (*main.font).as_ref().len(), t.elapsed());
+        let fonts: Vec<skrifa::FontRef> = [(*main.font).as_ref(), SYMBOLS_FONT, ICONS_FONT].iter().map(|b| skrifa::FontRef::new(b).unwrap()).collect();
+        let sources = [include_str!("gui.rs"), include_str!("gui/settings.rs"), include_str!("gui/vim.rs"), include_str!("icons.rs")];
+        let mut missing: Vec<char> = sources
+            .iter()
+            .flat_map(|s| s.lines().filter(|l| !l.trim_start().starts_with("//")))
+            .flat_map(str::chars)
+            .filter(|c| !c.is_ascii() && !c.is_control())
+            .filter(|&c| !fonts.iter().any(|f| f.charmap().map(c).is_some()))
+            .collect();
+        missing.sort();
+        missing.dedup();
+        assert!(missing.is_empty(), "no glyph for {missing:?}");
+    }
 
     /// Without a system font that has them (macOS), ⏎ ⇧ ⌥ used to render as boxes.
     #[test]

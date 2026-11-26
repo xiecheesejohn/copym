@@ -1,3 +1,13 @@
+# Maple Mono NF CN
+
+`maple-mono-nf-cn.ttf.zst` (7 MB, 20.6 MB unpacked) is
+`MapleMono-NF-CN-Regular.ttf` from [Maple Mono](https://github.com/subframe7536/maple-font)
+v7.9 (release asset `MapleMono-NF-CN.zip`, sha256
+af913b6322905348b3f50e4397fedc35b3a880db5effcce7969003051dcd3e94), unchanged,
+compressed with `zstd -19`. It is the UI font on every platform: monospace
+Latin, CJK and Nerd Font icons. SIL Open Font License 1.1, see
+`maple-mono-OFL.txt`.
+
 # copym Symbols
 
 `copym-symbols.ttf` (3 KB) holds only the symbols the popup shows

@@ -1,6 +1,6 @@
 [package]
 name = "copym"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 description = "A fast, modern, cross-platform clipboard manager"
 license = "MIT OR Apache-2.0"
@@ -29,6 +29,7 @@ serde_json = { version = "1.0.154", features = ["preserve_order"] }
 toml = "1.2.1"
 toml_edit = "0.25.19"
 xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
+ruzstd = "0.9.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.191"

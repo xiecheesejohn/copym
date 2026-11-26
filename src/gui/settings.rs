@@ -336,7 +336,7 @@ impl App {
                 ui.label(RichText::new(t!("-- 设置 --", "-- SETTINGS --")).size(13.0).strong().color(pal.accent));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
-                        RichText::new(t!("j/k 选择  h/l 修改  ␣ 切换  i 编辑  Tab 分类  ^S 保存  ZZ 保存并关闭  q 关闭", "j/k move  h/l change  ␣ toggle  i edit  Tab section  ^S save  ZZ save+close  q close"))
+                        RichText::new(t!("j/k 选择  h/l 修改  \u{f1050} 切换  i 编辑  Tab 分类  ^S 保存  ZZ 保存并关闭  q 关闭", "j/k move  h/l change  \u{f1050} toggle  i edit  Tab section  ^S save  ZZ save+close  q close"))
                             .size(10.5)
                             .color(pal.faint),
                     );
@@ -640,8 +640,6 @@ mod tests {
         let mut harness = Harness::builder()
             .with_size(Vec2::new(760.0, 480.0))
             .with_accessibility_check(false)
-            // CI runners may lack CJK fonts: the tests check keys, not glyphs
-            .allow_missing_glyphs()
             .build_ui_state(
             move |ui, app: &mut App| {
                 // fonts apply from the next frame: draw nothing until then

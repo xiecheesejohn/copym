@@ -250,6 +250,6 @@ cargo build --release    # target/release/copym
 
 ## License / 许可证
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. The built-in OCR model (PP-OCRv6 from PaddleOCR) is Apache-2.0, see [models/ppocr](models/ppocr/README.md); the key symbol font is cut from Adwaita Sans, SIL OFL 1.1, see [assets/fonts](assets/fonts/README.md).
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. The built-in OCR model (PP-OCRv6 from PaddleOCR) is Apache-2.0, see [models/ppocr](models/ppocr/README.md); the UI font is Maple Mono NF CN and the key symbol font is cut from Adwaita Sans, both SIL OFL 1.1, see [assets/fonts](assets/fonts/README.md).
 
-可任选 [MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE) 许可证。内置的 OCR 模型（PaddleOCR 的 PP-OCRv6）为 Apache-2.0，见 [models/ppocr](models/ppocr/README.md)；按键符号字体截取自 Adwaita Sans，SIL OFL 1.1，见 [assets/fonts](assets/fonts/README.md)。
+可任选 [MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE) 许可证。内置的 OCR 模型（PaddleOCR 的 PP-OCRv6）为 Apache-2.0，见 [models/ppocr](models/ppocr/README.md)；界面字体 Maple Mono NF CN 与截取自 Adwaita Sans 的按键符号字体均为 SIL OFL 1.1，见 [assets/fonts](assets/fonts/README.md)。
