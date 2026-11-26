@@ -195,11 +195,43 @@ struct DialogKeys {
     close: bool,
 }
 
+/// Is a text field being edited? Only then the keys belong to egui. Any
+/// other control that took the focus (Tab, a click on a drop-down, toggle or
+/// number) gives it back, or j/k/arrows would stop moving between rows.
+///
+/// egui drops the focus on Esc before we see the key, so a field that was
+/// edited in the previous frame still counts: its Esc only leaves the field.
+pub(super) fn dialog_focus(ctx: &egui::Context) -> bool {
+    let id = egui::Id::unique("copym-dialog-editing");
+    let now = ctx.text_edit_focused();
+    let before = ctx.data_mut(|d| {
+        let before = d.get_temp::<bool>(id).unwrap_or(false);
+        d.insert_temp(id, now);
+        before
+    });
+    if now {
+        return true;
+    }
+    if before && ctx.input(|i| i.key_pressed(Key::Escape)) {
+        return true;
+    }
+    ctx.memory_mut(|m| {
+        if let Some(id) = m.focused() {
+            m.surrender_focus(id);
+        }
+    });
+    false
+}
+
 fn dialog_keys(ctx: &egui::Context, pending: &mut String) -> DialogKeys {
     let mut k = DialogKeys::default();
-    let editing = ctx.egui_wants_keyboard_input();
+    let editing = dialog_focus(ctx);
+    let popup = egui::Popup::is_any_open(ctx);
     ctx.input_mut(|i| {
         k.save = i.consume_key(Modifiers::CTRL, Key::S) || i.consume_key(Modifiers::COMMAND, Key::S);
+        if popup {
+            return; // an open drop-down list takes the keys (Esc closes it)
+        }
         if editing {
             // Esc leaves the text field (back to NORMAL), not the dialog
             if i.consume_key(Modifiers::NONE, Key::Escape) || i.consume_key(Modifiers::CTRL, Key::OpenBracket) {
@@ -373,7 +405,7 @@ impl App {
                 });
             });
         });
-        if modal.should_close() && !ctx.egui_wants_keyboard_input() {
+        if modal.should_close() && !ctx.text_edit_focused() && !egui::Popup::is_any_open(ctx) {
             keep = false;
         }
         if save {
@@ -593,4 +625,117 @@ pub(super) fn restart_copym() {
         cmd.creation_flags(0x0000_0008 | 0x0000_0200); // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     }
     let _ = cmd.spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_kittest::{kittest::Queryable, Harness};
+
+    fn harness() -> Harness<'static, App> {
+        let mut app = App::new(Config::default(), Arc::default(), Arc::default());
+        app.error = None;
+        app.settings = Some(Settings::new(&app.cfg, false));
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder().with_size(Vec2::new(760.0, 480.0)).with_accessibility_check(false).build_ui_state(
+            move |ui, app: &mut App| {
+                // fonts apply from the next frame: draw nothing until then
+                if !fonts_ready {
+                    setup_ctx(ui.ctx(), &app.cfg);
+                    fonts_ready = true;
+                    return;
+                }
+                app.draw(ui)
+            },
+            app,
+        );
+        harness.run_steps(4);
+        harness
+    }
+
+    fn press(h: &mut Harness<'static, App>, key: Key) {
+        h.key_press(key);
+        h.run_steps(2);
+    }
+
+    fn typed(h: &mut Harness<'static, App>, text: &str) {
+        h.event(egui::Event::Text(text.into()));
+        h.run_steps(2);
+    }
+
+    fn row(h: &Harness<'static, App>) -> (usize, usize) {
+        let st = h.state().settings.as_ref().expect("settings open");
+        (st.section, st.row)
+    }
+
+    /// Tab focused the first control of the next section (a drop-down in
+    /// "popup"); a focused control used to swallow j/k as if typing.
+    #[test]
+    fn rows_move_after_switching_sections() {
+        let mut h = harness();
+        press(&mut h, Key::Tab);
+        assert_eq!(row(&h), (1, 0));
+        typed(&mut h, "j");
+        assert_eq!(row(&h), (1, 1));
+        press(&mut h, Key::ArrowDown);
+        assert_eq!(row(&h), (1, 2));
+        typed(&mut h, "k");
+        assert_eq!(row(&h), (1, 1));
+        // every section
+        for s in 2..SECTIONS.len() {
+            press(&mut h, Key::Tab);
+            assert_eq!(row(&h), (s, 0), "section {s}");
+            typed(&mut h, "j");
+            assert_eq!(row(&h), (s, 1), "section {s}");
+        }
+    }
+
+    /// Clicking a control (here the drop-down) must not take the keys away either.
+    #[test]
+    fn rows_move_after_clicking_a_control() {
+        let mut h = harness();
+        press(&mut h, Key::Tab);
+        h.get_by_value("‹ NORMAL ›").click();
+        h.run_steps(2);
+        press(&mut h, Key::Escape); // closes the drop-down list, not the dialog
+        assert!(h.state().settings.is_some());
+        typed(&mut h, "j");
+        assert_eq!(row(&h).1, 1);
+    }
+
+    /// The group manager uses the same rules: Tab must not steal j/k.
+    #[test]
+    fn group_editor_keys() {
+        let mut h = harness();
+        h.state_mut().settings = None;
+        let ed = Editor::new(&h.state().groups, 0);
+        h.state_mut().editor = Some(ed);
+        h.run_steps(3);
+        press(&mut h, Key::Tab);
+        press(&mut h, Key::Tab);
+        typed(&mut h, "j");
+        assert_eq!(h.state().editor.as_ref().expect("editor open").sel, 1);
+        typed(&mut h, "k");
+        assert_eq!(h.state().editor.as_ref().unwrap().sel, 0);
+        typed(&mut h, "q");
+        assert!(h.state().editor.is_none());
+    }
+
+    /// While a text field is edited, j is text and Esc leaves the field.
+    #[test]
+    fn text_fields_keep_their_keys() {
+        let mut h = harness();
+        press(&mut h, Key::Tab);
+        typed(&mut h, "j");
+        typed(&mut h, "j"); // "paste keys" row
+        assert_eq!(row(&h), (1, 2));
+        typed(&mut h, "i");
+        typed(&mut h, "j");
+        assert_eq!(row(&h), (1, 2));
+        assert_eq!(h.state().settings.as_ref().unwrap().draft.paste_shortcut, "j");
+        press(&mut h, Key::Escape);
+        assert!(h.state().settings.is_some());
+        typed(&mut h, "j");
+        assert_eq!(row(&h), (1, 3));
+    }
 }

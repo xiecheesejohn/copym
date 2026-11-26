@@ -42,9 +42,10 @@ fn insert_dedup_evict_search() {
     for t in ["x1", "x2", "x3", "x4"] {
         s.insert(Content::Text(t.into()), None).unwrap();
     }
-    let l = s.list(&q(""), Filter::All, 10);
-    assert_eq!(l[0].preview, "gamma");
-    assert_eq!(l.len(), 4);
+    // pinned items only show in the pinned group
+    let l: Vec<_> = s.list(&q(""), Filter::All, 10).into_iter().map(|m| m.preview).collect();
+    assert_eq!(l, ["x4", "x3", "x2"]);
+    assert_eq!(s.list(&q(""), Filter::Pinned, 10)[0].preview, "gamma");
     drop(s);
     // persistence
     let mut s = Store::open(&p, 3).unwrap();
@@ -83,8 +84,8 @@ fn groups_by_rules() {
     assert_eq!(names(&mut s, &from_code), ["fn main() {}"]);
     assert_eq!(s.list_group(&q(""), Some(&images), None, 10).items.len(), 1);
     assert_eq!(names(&mut s, &pinned), ["SELECT 1;"]);
-    assert_eq!(names(&mut s, &other), ["SELECT 1;"]);
-    assert_eq!(s.list_group(&q(""), None, None, 10).items.len(), 4);
+    assert!(names(&mut s, &other).is_empty()); // "SELECT 1;" is pinned
+    assert_eq!(s.list_group(&q(""), None, None, 10).items.len(), 3);
 
     let groups = vec![Some(link), Some(images), None];
     assert_eq!(s.group_counts(&q(""), &groups).counts, vec![Some(1), Some(1), None]);
@@ -169,7 +170,7 @@ fn sync_merge_order_and_tombstones() {
     let n = s.delete_synced(&[(gone.hash(), now + 100), (keep.hash(), now + 100)]).unwrap();
     assert_eq!(n, 1);
     assert_eq!(s.list(&q("gone"), Filter::All, 10).len(), 0);
-    assert_eq!(s.list(&q("pinned"), Filter::All, 10).len(), 1);
+    assert_eq!(s.list(&q("pinned"), Filter::Pinned, 10).len(), 1);
 
     // Tombstones survive a restart; copying again revives the content.
     drop(s);
@@ -275,12 +276,18 @@ fn views_count_and_persist() {
     let mut s = Store::open(&p, 10_000).unwrap();
     assert!(s.views.get(&link.fp).is_some_and(|v| v.cursor == 0 && v.count == 500));
     assert_eq!(s.group_counts(&q(""), &groups).counts, vec![Some(5000), Some(500), Some(5000)]);
-    // clear keeps pinned items only
+    // a pinned item leaves the other groups (lists and counts)
     let keep = s.list_group(&q("x.org/10"), None, None, 1).items[0].id;
     s.toggle_pin(keep).unwrap();
+    assert_eq!(s.group_counts(&q(""), &groups).counts, vec![Some(4999), Some(499), Some(4999)]);
+    assert_eq!(s.group_counts(&q("x.org/109"), &groups).counts, vec![Some(0), Some(0), Some(0)]);
+    assert!(page(&mut s, "x.org/1090", None, 10).0.is_empty());
+    let pinned = GroupMatcher::new(&GroupRule { pinned: true, ..Default::default() }).unwrap();
+    assert_eq!(s.group_counts(&q("x.org/109"), &[Some(pinned.clone())]).counts, vec![Some(1)]);
+    // clear keeps pinned items only
     s.clear().unwrap();
-    assert_eq!(s.group_counts(&q(""), &groups).counts, vec![Some(1), Some(1), Some(1)]);
-    assert_eq!(page(&mut s, "x.org", None, 10).0, ["https://x.org/1090"]);
+    assert_eq!(s.group_counts(&q(""), &groups).counts, vec![Some(0), Some(0), Some(0)]);
+    assert_eq!(s.list_group(&q(""), Some(&pinned), None, 10).items[0].preview, "https://x.org/1090");
     drop(s);
     rm(&p);
 }
@@ -303,7 +310,7 @@ fn pin_groups() {
     assert_eq!(names(&mut s, &board(3)), ["ssh prod-1"]);
     let groups = vec![Some(board(2)), Some(board(3)), Some(any)];
     assert_eq!(s.group_counts(&q(""), &groups).counts, vec![Some(2), Some(1), Some(3)]);
-    let m = s.list_group(&q("ssh"), None, None, 1).items.remove(0);
+    let m = s.list_group(&q("ssh"), Some(&board(3)), None, 1).items.remove(0);
     assert_eq!((m.pinned, m.board), (true, 3));
     // pinned items survive eviction and re-copies keep their group
     for t in ["x1", "x2", "x3", "x4", "x5"] {

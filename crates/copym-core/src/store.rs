@@ -322,6 +322,11 @@ impl GroupMatcher {
         Ok(Self { fp: xxhash_rust::xxh3::xxh3_64(&key) >> 1, all, ..m })
     }
 
+    /// A pin group: lists pinned items, which every other group leaves out.
+    fn pins(&self) -> bool {
+        self.pinned || self.board.is_some()
+    }
+
     /// Only type / pinned conditions: answered from indexes, no view needed.
     fn sql_only(&self) -> bool {
         self.patterns.is_empty() && self.apps.is_empty() && self.exclude.is_empty() && self.exclude_apps.is_empty()
@@ -632,8 +637,9 @@ impl Store {
         self.list_group(query, m.as_ref(), None, limit).items
     }
 
-    /// Items of a group (`None` = all): pinned first (on the first page), then
-    /// newest first. Continue with `before = page.next`.
+    /// Items of a group (`None` = all), newest first. Pinned items only show
+    /// in groups that ask for them (`pinned` / `board`), never in the others.
+    /// Continue with `before = page.next`.
     pub fn list_group(&mut self, query: &Query, group: Option<&GroupMatcher>, before: Option<u64>, limit: usize) -> Page {
         let deadline = Instant::now() + SEARCH_BUDGET;
         let group = group.filter(|g| !g.all);
@@ -644,17 +650,23 @@ impl Store {
         Page { items: self.finish(rows), next }
     }
 
-    /// Rows matching `query` and `group`, pinned ones first when `before` is None.
+    /// Every pinned row, newest first (there are few).
+    fn pinned_rows(&self) -> R<Vec<Row>> {
+        let mut st = self.db.prepare_cached(&format!("{} WHERE i.pinned != 0 ORDER BY i.id DESC", select(true))).map_err(e)?;
+        let rows = st.query_map([], |r| Row::read(r, true)).map_err(e)?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// Rows matching `query` and `group`. A pin group lists its (few) pinned
+    /// items in one page; other groups leave pinned items out.
     fn collect(&mut self, query: &Query, group: Option<&GroupMatcher>, before: Option<u64>, limit: usize, deadline: Instant) -> R<(Vec<Row>, Option<u64>)> {
         let keep = |row: &Row| query.matches(row) && group.is_none_or(|g| g.matches(row));
         let mut out: Vec<Row> = Vec::new();
-        if before.is_none() {
-            let mut st = self.db.prepare_cached(&format!("{} WHERE i.pinned != 0 ORDER BY i.id DESC", select(true))).map_err(e)?;
-            let rows = st.query_map([], |r| Row::read(r, true)).map_err(e)?;
-            out.extend(rows.filter_map(Result::ok).filter(|r| keep(r)));
-        }
-        if group.is_some_and(|g| g.pinned || g.board.is_some()) {
-            return Ok((out, None)); // all of them came above
+        if group.is_some_and(|g| g.pins()) {
+            if before.is_none() {
+                out = self.pinned_rows()?.into_iter().filter(|r| keep(r)).collect();
+            }
+            return Ok((out, None));
         }
         let mut cursor = before.unwrap_or(i64::MAX as u64);
         let mut found = 0;
@@ -867,34 +879,46 @@ impl Store {
                         }
                         let v = &self.views[&g.fp];
                         more |= v.cursor != 0;
-                        v.count as u32
+                        // pinned items only show in pin groups
+                        let pinned: i64 = self
+                            .db
+                            .query_row("SELECT count(*) FROM items i JOIN members m ON m.view = ?1 AND m.id = i.id WHERE i.pinned != 0", [g.fp as i64], |r| r.get(0))
+                            .unwrap_or(0);
+                        v.count.saturating_sub(pinned as u64) as u32
                     })
                 })
                 .collect();
             return Counts { counts, more };
         }
         let (rows, next) = self.collect(query, None, None, COUNT_CAP, deadline).unwrap_or_default();
-        let counts = groups.iter().map(|g| g.as_ref().map(|g| rows.iter().filter(|r| g.matches(r)).count() as u32)).collect();
+        let pinned: Vec<Row> = self.pinned_rows().unwrap_or_default().into_iter().filter(|r| query.matches(r)).collect();
+        let counts = groups
+            .iter()
+            .map(|g| g.as_ref().map(|g| if g.pins() { &pinned } else { &rows }.iter().filter(|r| g.matches(r)).count() as u32))
+            .collect();
         Counts { counts, more: next.is_some() }
     }
 
     /// Count of a type / pinned rule, from counters and the pinned index.
+    /// Other groups leave pinned items out.
     fn sql_count(&self, g: &GroupMatcher) -> u64 {
-        if g.pinned || g.board.is_some() {
-            let kind = match g.kind {
-                None => "",
-                Some(Kind::Text) => " AND kind = 0",
-                Some(Kind::Image) => " AND kind = 1",
-            };
-            let board = if g.board.is_some() { " AND pinned = ?1" } else { " AND ?1 IS NOT NULL" };
-            let sql = format!("SELECT count(*) FROM items WHERE pinned != 0{kind}{board}");
-            return self.db.query_row(&sql, [g.board.unwrap_or(0) as i64], |r| r.get::<_, i64>(0)).map(|n| n as u64).unwrap_or(0);
+        let kind = match g.kind {
+            None => "",
+            Some(Kind::Text) => " AND kind = 0",
+            Some(Kind::Image) => " AND kind = 1",
+        };
+        let board = if g.board.is_some() { " AND pinned = ?1" } else { " AND ?1 IS NOT NULL" };
+        let sql = format!("SELECT count(*) FROM items WHERE pinned != 0{kind}{board}");
+        let pinned = self.db.query_row(&sql, [g.board.unwrap_or(0) as i64], |r| r.get::<_, i64>(0)).map(|n| n as u64).unwrap_or(0);
+        if g.pins() {
+            return pinned;
         }
-        match g.kind {
+        let all = match g.kind {
             None => self.total,
             Some(Kind::Text) => self.total - self.images,
             Some(Kind::Image) => self.images,
-        }
+        };
+        all.saturating_sub(pinned)
     }
 
     // ------------------------------------------------------------ views --

@@ -2659,7 +2659,7 @@ fn dialog_room(ctx: &egui::Context, want: f32) -> (f32, f32) {
 /// Keys of a dialog with text fields: (j/k step, Ctrl-S, q/Esc close).
 /// While a field is being edited only Esc is taken (it leaves the field).
 fn dialog_vim_keys(ctx: &egui::Context) -> (isize, bool, bool) {
-    let editing = ctx.egui_wants_keyboard_input();
+    let editing = settings::dialog_focus(ctx);
     let (nav, save, esc) = ctx.input_mut(|i| {
         let save = i.consume_key(Modifiers::CTRL, Key::S) || i.consume_key(Modifiers::COMMAND, Key::S);
         if editing {

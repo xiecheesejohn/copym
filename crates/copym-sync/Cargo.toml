@@ -1,6 +1,6 @@
 [package]
 name = "copym-sync"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 description = "End-to-end encrypted LAN clipboard sync core for copym (platform independent, reusable on Android)"
 license = "MIT OR Apache-2.0"
