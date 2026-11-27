@@ -262,11 +262,11 @@ impl App {
             ("y", 'y') => return Some(Action::Activate(sel, false)),
             ("Z", 'Z') | ("Z", 'Q') => self.close(ctx),
             ("z", _) => self.scroll_to_selected = true,
-            // m{key}: put into that pin group (like setting a Vim mark); mm without
-            // a group on m toggles the first one
+            // m{key}: put into that pin group (like setting a Vim mark); the
+            // built-in one is on 0 (m0); mm without a group on m toggles the first one
             ("m", _) => match self.groups.by_key(c, true).map(|(_, g)| g.board) {
                 Some(b) => return Some(Action::PinTo(sel, b)),
-                None if c == 'm' => return Some(Action::Pin(sel)),
+                None if c == '0' || c == 'm' => return Some(Action::Pin(sel)),
                 None => self.notify(tf!("没有按键为 {c} 的固定分组", "no pin group on key {c}")),
             },
             // '{key} / `{key}: jump to that group
@@ -549,6 +549,7 @@ impl App {
                         Ok(()) => {
                             self.cfg.language = value.into();
                             crate::init_language(value);
+                            self.groups.localize();
                             self.dirty = true;
                         }
                         Err(e) => self.notify(e),
@@ -591,7 +592,7 @@ impl App {
             ("⏎  p", t!("粘贴到之前的窗口", "paste into the previous window")),
             ("yy  ⇧⏎", t!("只复制到剪贴板", "copy only")),
             ("dd  x", t!("删除", "delete")),
-            ("m{x}  mm", t!("放进按键为 x 的固定分组（再按取消）/ 默认固定分组", "put into the pin group on key x (again: unpin) / the default one")),
+            ("m{x}  m0", t!("放进按键为 x 的固定分组（再按取消）/ 默认固定分组", "put into the pin group on key x (again: unpin) / the default one")),
             ("'{x}", t!("跳到按键为 x 的分组", "go to the group on key x")),
             ("o", t!("打开链接或路径", "open link or path")),
             ("/  i", t!("搜索（Esc 回到列表，保留关键词）", "search (Esc back to the list, keeps it)")),

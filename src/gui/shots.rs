@@ -35,14 +35,14 @@ fn app(theme: &str, lang: Lang) -> App {
     app.error = None;
     app.dirty = false;
     app.items = vec![
-        item(2, Kind::Text, "https://github.com/xiecheesejohn/copym/releases/latest", 5, true),
         item(1, Kind::Text, "您的验证码是 482913，5 分钟内有效。", 1, false),
+        item(2, Kind::Text, "https://github.com/xiecheesejohn/copym/releases/latest", 5, true),
         item(3, Kind::Text, "fn main() {\n    println!(\"hello\");\n}", 30, false),
         item(4, Kind::Text, "Mixed English 与中文 gjpqy 混排 descenders and a long line that gets cut", 90, false),
         item(5, Kind::Text, "~/Documents/copym/README.md", 60 * 26, false),
     ];
     app.layout_list();
-    app.selected = 1;
+    app.selected = 0;
     app.detail = Some((1, Detail::Text { kind: TextKind::Plain, body: "您的验证码是 482913，5 分钟内有效。".into() }));
     app
 }
@@ -108,16 +108,22 @@ fn shots() {
             });
             let power = Pos2::new(WINDOW.x - 10.0 - 13.0, WINDOW.y - FOOTER_H / 2.0);
             shoot_click(&format!("power-{t}-{l}"), app(theme, lang), WINDOW, |_| {}, Some(power));
+            // the group list (top right), with the default marker and counts
+            let groups = Pos2::new(WINDOW.x - 12.0 - 40.0, SEARCH_H / 2.0);
+            shoot_click(&format!("groups-{t}-{l}"), app(theme, lang), WINDOW, |a| a.counts = vec![Some(5), Some(4), Some(1), Some(1), Some(1)], Some(groups));
             // several pin groups: sections per group, 'key markers, which-key after m
             let boards = |a: &mut App| {
                 use crate::groups::GroupDef;
                 a.groups.list.push(GroupDef { name: t!("常用回复", "Replies").into(), pinned: true, board: 2, key: "r".into(), ..Default::default() });
                 a.groups.list.push(GroupDef { name: t!("服务器", "Servers").into(), pinned: true, board: 3, key: "s".into(), ..Default::default() });
-                a.items[1].pinned = true;
-                a.items[1].board = 2;
+                a.items[0].pinned = true;
+                a.items[0].board = 2;
                 a.items[2].pinned = true;
                 a.items[2].board = 3;
-                a.items.sort_by_key(|m| (std::cmp::Reverse(m.pinned), m.board));
+                // the "pinned" group lists them by pin group
+                a.items.retain(|m| m.pinned);
+                a.items.sort_by_key(|m| m.board);
+                a.group = a.groups.list.iter().position(|g| g.pinned).unwrap_or(0);
                 a.layout_list();
                 a.pending = "m".into();
             };

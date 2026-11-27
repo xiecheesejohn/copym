@@ -589,6 +589,7 @@ impl App {
         }
         if st.draft.language != self.cfg.language {
             crate::init_language(&st.draft.language);
+            self.groups.localize();
         }
         self.cfg = st.draft.clone();
         // the daemon reloads filters and the paste keys; the rest needs a restart

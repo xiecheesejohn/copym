@@ -71,7 +71,7 @@ impl Default for Groups {
                 g(crate::t!("固定", "Pinned"), &|d| {
                     d.pinned = true;
                     d.board = 1;
-                    d.key = "m".into();
+                    d.key = "0".into();
                 }),
             ],
         }
@@ -116,14 +116,43 @@ pub fn to_toml(g: &Groups) -> Result<String, String> {
 }
 
 pub fn from_toml(s: &str) -> Result<Groups, String> {
-    let g: Groups = toml::from_str(s).map_err(|e| e.to_string())?;
+    let mut g: Groups = toml::from_str(s).map_err(|e| e.to_string())?;
     if g.list.is_empty() {
         return Err(crate::t!("没有任何分组", "there are no groups").into());
+    }
+    g.localize();
+    // the built-in pin group used to answer to m (mm); it is m0 / '0 now
+    for d in g.list.iter_mut().filter(|d| d.board == 1 && d.key == "m" && BUILT_IN.iter().any(|(zh, en)| d.name == *zh || d.name == *en)) {
+        d.key = "0".into();
     }
     Ok(g)
 }
 
+/// Names of the built-in groups in both languages.
+const BUILT_IN: [(&str, &str); 5] = [("全部", "All"), ("文本", "Text"), ("图片", "Images"), ("链接", "Links"), ("固定", "Pinned")];
+
 impl Groups {
+    /// Built-in group names (still as created, in either language) follow
+    /// the current UI language; names the user chose stay as they are.
+    pub fn localize(&mut self) {
+        let fix = |name: &mut String| {
+            if let Some((zh, en)) = BUILT_IN.iter().find(|(zh, en)| name == zh || name == en) {
+                let want = crate::t!(*zh, *en);
+                if name != want {
+                    *name = want.to_string();
+                }
+            }
+        };
+        let names: Vec<String> = self.list.iter().map(|g| g.name.clone()).collect();
+        for g in &mut self.list {
+            fix(&mut g.name);
+        }
+        // `default` points at a group by name: follow its rename
+        if let Some(i) = names.iter().position(|n| *n == self.default) {
+            self.default = self.list[i].name.clone();
+        }
+    }
+
     pub fn default_index(&self) -> usize {
         self.list.iter().position(|g| g.name == self.default).unwrap_or(0)
     }
@@ -238,6 +267,32 @@ impl GroupDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Built-in names follow the language (in either direction); the user's
+    /// own names and the default pointer stay consistent.
+    #[test]
+    fn built_in_names_follow_the_language() {
+        let mut g = Groups { default: "Text".into(), list: Vec::new() };
+        for name in ["全部", "Text", "图片", "Links", "Pinned", "我的分组"] {
+            g.list.push(GroupDef { name: name.into(), ..Default::default() });
+        }
+        g.localize();
+        let names: Vec<&str> = g.list.iter().map(|d| d.name.as_str()).collect();
+        let want = [crate::t!("全部", "All"), crate::t!("文本", "Text"), crate::t!("图片", "Images"), crate::t!("链接", "Links"), crate::t!("固定", "Pinned"), "我的分组"];
+        assert_eq!(names, want);
+        assert_eq!(g.default, crate::t!("文本", "Text"));
+    }
+
+    /// Old files put the built-in pin group on m; it moves to 0 (m0), a
+    /// pin group of the user's own keeps its key.
+    #[test]
+    fn built_in_pin_group_moves_to_0() {
+        let old = "default = \"全部\"\n[[group]]\nname = \"全部\"\n[[group]]\nname = \"固定\"\npinned = true\nboard = 1\nkey = \"m\"\n[[group]]\nname = \"Mine\"\nboard = 2\nkey = \"m\"\n";
+        let g = from_toml(old).unwrap();
+        let keys: Vec<&str> = g.list.iter().map(|d| d.key.as_str()).collect();
+        assert_eq!(keys, ["", "0", "m"]);
+        assert_eq!(Groups::default().list[4].key, "0");
+    }
 
     #[test]
     fn roundtrip_and_rest_rule() {

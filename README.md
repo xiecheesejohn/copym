@@ -49,7 +49,7 @@ copym 是一个剪贴板历史管理器，支持 Linux、Windows、macOS 和安�
 | `Enter` / `Shift+Enter` | 粘贴 / 只复制 |
 | `Alt+1…9` | 直接粘贴第 1…9 条 |
 | `dd` | 删除 |
-| `mm` | 固定 / 取消固定 |
+| `m0` | 固定 / 取消固定 |
 | `m` + 字母 | 放进对应的固定分组 |
 | `'` + 字母、`Tab`、`Ctrl+1…9` | 切换分组 |
 | `o` | 打开链接或文件路径 |
@@ -170,7 +170,7 @@ Start at login: turn it on in the settings (`Ctrl+,` in the popup, `⌘,` on mac
 | `Enter` / `Shift+Enter` | Paste / copy only |
 | `Alt+1…9` | Paste item 1…9 |
 | `dd` | Delete |
-| `mm` | Pin / unpin |
+| `m0` | Pin / unpin |
 | `m` + letter | Put into that pin group |
 | `'` + letter, `Tab`, `Ctrl+1…9` | Switch group |
 | `o` | Open a link or path |

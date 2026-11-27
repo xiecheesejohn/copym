@@ -42,9 +42,11 @@ fn insert_dedup_evict_search() {
     for t in ["x1", "x2", "x3", "x4"] {
         s.insert(Content::Text(t.into()), None).unwrap();
     }
-    // pinned items only show in the pinned group
+    // pinned items stay at their place in time (not on top)
     let l: Vec<_> = s.list(&q(""), Filter::All, 10).into_iter().map(|m| m.preview).collect();
-    assert_eq!(l, ["x4", "x3", "x2"]);
+    assert_eq!(l, ["x4", "x3", "x2", "gamma"]);
+    let text = GroupMatcher::new(&GroupRule { kind: Some(Kind::Text), ..Default::default() }).unwrap();
+    assert_eq!(s.list_group(&q(""), Some(&text), None, 10).items.len(), 3); // rule groups leave them out
     assert_eq!(s.list(&q(""), Filter::Pinned, 10)[0].preview, "gamma");
     drop(s);
     // persistence
@@ -85,7 +87,7 @@ fn groups_by_rules() {
     assert_eq!(s.list_group(&q(""), Some(&images), None, 10).items.len(), 1);
     assert_eq!(names(&mut s, &pinned), ["SELECT 1;"]);
     assert!(names(&mut s, &other).is_empty()); // "SELECT 1;" is pinned
-    assert_eq!(s.list_group(&q(""), None, None, 10).items.len(), 3);
+    assert_eq!(s.list_group(&q(""), None, None, 10).items.len(), 4); // "all" keeps it
 
     let groups = vec![Some(link), Some(images), None];
     assert_eq!(s.group_counts(&q(""), &groups).counts, vec![Some(1), Some(1), None]);
@@ -276,17 +278,17 @@ fn views_count_and_persist() {
     let mut s = Store::open(&p, 10_000).unwrap();
     assert!(s.views.get(&link.fp).is_some_and(|v| v.cursor == 0 && v.count == 500));
     assert_eq!(s.group_counts(&q(""), &groups).counts, vec![Some(5000), Some(500), Some(5000)]);
-    // a pinned item leaves the other groups (lists and counts)
+    // a pinned item stays in "all" (in time order) and leaves rule groups
     let keep = s.list_group(&q("x.org/10"), None, None, 1).items[0].id;
     s.toggle_pin(keep).unwrap();
-    assert_eq!(s.group_counts(&q(""), &groups).counts, vec![Some(4999), Some(499), Some(4999)]);
-    assert_eq!(s.group_counts(&q("x.org/109"), &groups).counts, vec![Some(0), Some(0), Some(0)]);
-    assert!(page(&mut s, "x.org/1090", None, 10).0.is_empty());
+    assert_eq!(s.group_counts(&q(""), &groups).counts, vec![Some(5000), Some(499), Some(4999)]);
+    assert_eq!(s.group_counts(&q("x.org/109"), &groups).counts, vec![Some(1), Some(0), Some(0)]);
+    assert_eq!(page(&mut s, "x.org/10", None, 3).0, ["https://x.org/1090", "https://x.org/1080", "https://x.org/1070"]);
     let pinned = GroupMatcher::new(&GroupRule { pinned: true, ..Default::default() }).unwrap();
     assert_eq!(s.group_counts(&q("x.org/109"), &[Some(pinned.clone())]).counts, vec![Some(1)]);
     // clear keeps pinned items only
     s.clear().unwrap();
-    assert_eq!(s.group_counts(&q(""), &groups).counts, vec![Some(0), Some(0), Some(0)]);
+    assert_eq!(s.group_counts(&q(""), &groups).counts, vec![Some(1), Some(0), Some(0)]);
     assert_eq!(s.list_group(&q(""), Some(&pinned), None, 10).items[0].preview, "https://x.org/1090");
     drop(s);
     rm(&p);
@@ -326,4 +328,88 @@ fn pin_groups() {
     assert_eq!(names(&mut s, &board(1)), ["x5"]);
     drop(s);
     rm(&p);
+}
+
+/// Timing of a long text: copying it, and searching words near its end.
+/// `cargo test --release -p copym-core long_text_timing -- --ignored --nocapture`
+#[test]
+#[ignore = "timing"]
+fn long_text_timing() {
+    let p = tmp("long-timing");
+    let mut s = Store::open(&p, 1_000_000).unwrap();
+    let base = now_secs() - 1_000_000;
+    s.bulk_insert_texts((0..100_000).map(|i| (format!("note {i} 日常记录 lorem ipsum {}", i * 7919 % 100_003), base + i, None))).unwrap();
+    let line = "日志 2026-11-27 12:00:00 INFO request handled in 12ms path=/api/v1/items user=42 中文内容测试\n";
+    let mut long = line.repeat(4 * 1024 * 1024 / line.len());
+    long.push_str("尾部的唯一标记 zq9x7-needle\n");
+    // a real sample: COPYM_SAMPLE=file
+    if let Some(f) = std::env::var_os("COPYM_SAMPLE") {
+        let text = String::from_utf8_lossy(&std::fs::read(f).unwrap()).into_owned();
+        let z = encode(&text);
+        let t = Instant::now();
+        for _ in 0..10 {
+            std::hint::black_box(decode(&z));
+        }
+        let d = t.elapsed() / 10;
+        eprintln!("sample body: {} -> {} bytes (x{:.2}), decode {:?} = {:.0} MB/s", text.len(), z.len(), text.len() as f64 / z.len() as f64, d, text.len() as f64 / d.as_secs_f64() / 1e6);
+    }
+    let z = encode(&long);
+    let t = Instant::now();
+    let back = decode(&z);
+    eprintln!("body: {} -> {} bytes, decode {:?}", long.len(), z.len(), t.elapsed());
+    let t = Instant::now();
+    assert!(contains_ci(&back, "zq9x7-needle"));
+    eprintln!("scan: {:?}", t.elapsed());
+    let t = Instant::now();
+    s.insert(Content::Text(long.clone()), None).unwrap();
+    eprintln!("insert {} MB: {:?}", 4, t.elapsed());
+    // 20 more long texts: every trigram of "handled request" is in each, the phrase in none
+    for i in 0..20 {
+        s.insert(Content::Text(format!("{long}{i}")), None).unwrap();
+    }
+    for needle in ["zq9x7-needle", "尾部的唯一标记", "lorem", "request handled", "不存在的词组合", "handled request", "中文测试内容"] {
+        let t = Instant::now();
+        let n = s.list_group(&q(needle), None, None, 200).items.len();
+        eprintln!("search {needle:?}: {n} hits in {:?}", t.elapsed());
+    }
+    drop(s);
+    rm(&p);
+}
+
+/// Words anywhere in a long text are found, also in a database whose index
+/// still holds only the first 64 KB of it (versions up to 0.2.4).
+#[test]
+fn long_texts_are_searchable_to_the_end() {
+    let p = tmp("long");
+    let mut s = Store::open(&p, 100).unwrap();
+    let long = format!("{}末尾的标记 tail-marker", "填充文字 filler text\n".repeat(20_000));
+    let id = s.insert(Content::Text(long.clone()), None).unwrap();
+    assert_eq!(s.list(&q("tail-marker"), Filter::All, 10).len(), 1);
+    assert_eq!(s.list(&q("末尾的标记"), Filter::All, 10).len(), 1);
+    // turn it into an old database: index cut at 64 KB, no index version
+    s.db.execute("DELETE FROM fts WHERE rowid = ?1", [id as i64]).unwrap();
+    s.db.execute("INSERT INTO fts(rowid, text, source) VALUES (?1, ?2, '')", params![id as i64, &long[..long.floor_char_boundary(64 * 1024)]]).unwrap();
+    s.db.execute("DELETE FROM info WHERE key = 'fts'", []).unwrap();
+    assert_eq!(s.list(&q("tail-marker"), Filter::All, 10).len(), 0);
+    drop(s);
+    let mut s = Store::open(&p, 100).unwrap();
+    assert_eq!(s.list(&q("tail-marker"), Filter::All, 10).len(), 1);
+    assert_eq!(s.list(&q("末尾的标记"), Filter::All, 10).len(), 1);
+    assert_eq!(s.list(&q("filler"), Filter::All, 10).len(), 1);
+    drop(s);
+    rm(&p);
+}
+
+/// New bodies are zstd; raw and lz4 ones (up to 0.2.4) still read back.
+#[test]
+fn body_formats() {
+    let long = "剪贴板 clipboard 历史 history\n".repeat(500);
+    for t in ["short", long.as_str()] {
+        assert_eq!(decode(&encode(t)), t);
+    }
+    assert_eq!(encode(&long)[0], 2);
+    assert_eq!(encode("short")[0], 0);
+    let mut lz4 = vec![1];
+    lz4.extend(lz4_flex::compress_prepend_size(long.as_bytes()));
+    assert_eq!(decode(&lz4), long);
 }

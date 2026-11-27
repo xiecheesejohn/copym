@@ -41,9 +41,10 @@ const PREVIEW_CHARS: usize = 600;
 const THUMB_SIZE: u32 = 480;
 /// OCR text sent to the GUI per item (search always uses the full text).
 const OCR_VIEW_CHARS: usize = 4000;
-/// The full-text index covers the first part of each text (a match further
-/// into a huge text is still found by short / regex scans, not by the index).
-const INDEX_BYTES: usize = 64 * 1024;
+/// Up to version 1 the full-text index only held the first 64 KB of a text;
+/// opening such a database indexes the rest of the longer ones once.
+const OLD_INDEX_BYTES: i64 = 64 * 1024;
+const FTS_VERSION: u64 = 2;
 /// Texts shorter than this are stored as they are.
 const COMPRESS_MIN: usize = 256;
 /// How long one list / count request may scan before it returns what it has.
@@ -184,14 +185,20 @@ impl Row {
     }
 }
 
+/// zstd level for stored texts: about half the size of lz4, decoding as fast.
+const ZSTD_LEVEL: i32 = 3;
+
+/// A stored text body: one tag byte, then 0 = raw, 1 = lz4 (up to 0.2.4,
+/// still read), 2 = zstd.
 fn encode(t: &str) -> Vec<u8> {
     if t.len() >= COMPRESS_MIN {
-        let c = lz4_flex::compress_prepend_size(t.as_bytes());
-        if c.len() < t.len() * 9 / 10 {
-            let mut v = Vec::with_capacity(c.len() + 1);
-            v.push(1);
-            v.extend_from_slice(&c);
-            return v;
+        if let Ok(c) = zstd::bulk::compress(t.as_bytes(), ZSTD_LEVEL) {
+            if c.len() < t.len() * 9 / 10 {
+                let mut v = Vec::with_capacity(c.len() + 1);
+                v.push(2);
+                v.extend_from_slice(&c);
+                return v;
+            }
         }
     }
     let mut v = Vec::with_capacity(t.len() + 1);
@@ -203,23 +210,16 @@ fn encode(t: &str) -> Vec<u8> {
 fn decode(z: &[u8]) -> String {
     let bytes = match z.split_first() {
         Some((1, c)) => lz4_flex::decompress_size_prepended(c).unwrap_or_default(),
+        Some((2, c)) => match zstd::zstd_safe::get_frame_content_size(c) {
+            Ok(Some(n)) => zstd::bulk::decompress(c, n as usize).unwrap_or_default(),
+            _ => zstd::stream::decode_all(c).unwrap_or_default(),
+        },
         Some((_, raw)) => raw.to_vec(),
         None => Vec::new(),
     };
     String::from_utf8(bytes).unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
 }
 
-/// The part of a text that goes into the full-text index.
-fn index_part(t: &str) -> &str {
-    if t.len() <= INDEX_BYTES {
-        return t;
-    }
-    let mut end = INDEX_BYTES;
-    while !t.is_char_boundary(end) {
-        end -= 1;
-    }
-    &t[..end]
-}
 
 // --------------------------------------------------------------- queries --
 
@@ -428,7 +428,30 @@ impl Store {
             db.execute("DELETE FROM views WHERE fp = ?1", [fp]).map_err(e)?;
             db.execute("DELETE FROM members WHERE view = ?1", [fp]).map_err(e)?;
         }
-        Ok(Self { db, total, images, max_items: max_items.max(1), views, checkpointed: Instant::now() })
+        let mut store = Self { db, total, images, max_items: max_items.max(1), views, checkpointed: Instant::now() };
+        if get_info(&store.db, "fts")? != Some(FTS_VERSION) {
+            store.index_long_texts()?;
+        }
+        Ok(store)
+    }
+
+    /// Re-index the texts the old index cut at 64 KB, so words anywhere in
+    /// them are found (once, when an older database is opened).
+    fn index_long_texts(&mut self) -> R<()> {
+        let tx = self.db.transaction().map_err(e)?;
+        let ids: Vec<u64> = {
+            let mut st = tx.prepare("SELECT id FROM items WHERE kind = 0 AND bytes > ?1").map_err(e)?;
+            st.query_map([OLD_INDEX_BYTES], |r| r.get::<_, i64>(0)).map_err(e)?.filter_map(Result::ok).map(|v| v as u64).collect()
+        };
+        // one at a time: these texts can be megabytes each
+        for id in ids {
+            for row in fetch_rows(&tx, &[id], true)? {
+                tx.execute("DELETE FROM fts WHERE rowid = ?1", [id as i64]).map_err(e)?;
+                fts_insert(&tx, id, row.haystack(), row.meta.source.as_deref())?;
+            }
+        }
+        tx.execute("INSERT OR REPLACE INTO info(key, value) VALUES ('fts', ?1)", [FTS_VERSION as i64]).map_err(e)?;
+        tx.commit().map_err(e)
     }
 
     pub fn len(&self) -> usize {
@@ -637,8 +660,8 @@ impl Store {
         self.list_group(query, m.as_ref(), None, limit).items
     }
 
-    /// Items of a group (`None` = all), newest first. Pinned items only show
-    /// in groups that ask for them (`pinned` / `board`), never in the others.
+    /// Items of a group (`None` = all), newest first. Pinned items show in
+    /// "all" (at their place in time) and in pin groups, not in rule groups.
     /// Continue with `before = page.next`.
     pub fn list_group(&mut self, query: &Query, group: Option<&GroupMatcher>, before: Option<u64>, limit: usize) -> Page {
         let deadline = Instant::now() + SEARCH_BUDGET;
@@ -658,7 +681,8 @@ impl Store {
     }
 
     /// Rows matching `query` and `group`. A pin group lists its (few) pinned
-    /// items in one page; other groups leave pinned items out.
+    /// items in one page; "all" (`group` None) has them in time order; other
+    /// groups leave them out.
     fn collect(&mut self, query: &Query, group: Option<&GroupMatcher>, before: Option<u64>, limit: usize, deadline: Instant) -> R<(Vec<Row>, Option<u64>)> {
         let keep = |row: &Row| query.matches(row) && group.is_none_or(|g| g.matches(row));
         let mut out: Vec<Row> = Vec::new();
@@ -668,12 +692,13 @@ impl Store {
             }
             return Ok((out, None));
         }
+        let with_pinned = group.is_none();
         let mut cursor = before.unwrap_or(i64::MAX as u64);
         let mut found = 0;
         // Adds the matches of one batch; `Some(id)` once the page is full.
         let mut take = |out: &mut Vec<Row>, batch: Vec<Row>, checked: bool| -> Option<u64> {
             for row in batch {
-                if row.meta.pinned || !(checked || keep(&row)) {
+                if (row.meta.pinned && !with_pinned) || !(checked || keep(&row)) {
                     continue;
                 }
                 let id = row.meta.id;
@@ -800,8 +825,9 @@ impl Store {
             } else {
                 let kind = group.and_then(|g| g.kind);
                 let sql = format!(
-                    "{} WHERE i.id < ?1 AND i.pinned = 0{} ORDER BY i.id DESC LIMIT ?2",
+                    "{} WHERE i.id < ?1{}{} ORDER BY i.id DESC LIMIT ?2",
                     select(need_text),
+                    if with_pinned { "" } else { " AND i.pinned = 0" },
                     match kind {
                         Some(Kind::Text) => " AND i.kind = 0",
                         Some(Kind::Image) => " AND i.kind = 1",
@@ -894,7 +920,16 @@ impl Store {
         let pinned: Vec<Row> = self.pinned_rows().unwrap_or_default().into_iter().filter(|r| query.matches(r)).collect();
         let counts = groups
             .iter()
-            .map(|g| g.as_ref().map(|g| if g.pins() { &pinned } else { &rows }.iter().filter(|r| g.matches(r)).count() as u32))
+            .map(|g| {
+                g.as_ref().map(|g| {
+                    if g.pins() {
+                        pinned.iter().filter(|r| g.matches(r)).count() as u32
+                    } else {
+                        // rule groups leave pinned items out; "all" keeps them
+                        rows.iter().filter(|r| (g.all || !r.meta.pinned) && g.matches(r)).count() as u32
+                    }
+                })
+            })
             .collect();
         Counts { counts, more: next.is_some() }
     }
@@ -912,6 +947,9 @@ impl Store {
         let pinned = self.db.query_row(&sql, [g.board.unwrap_or(0) as i64], |r| r.get::<_, i64>(0)).map(|n| n as u64).unwrap_or(0);
         if g.pins() {
             return pinned;
+        }
+        if g.all {
+            return self.total;
         }
         let all = match g.kind {
             None => self.total,
@@ -1175,7 +1213,7 @@ impl Store {
     fn collect_pinned_for_index(&self) -> R<Vec<(u64, String, Option<String>)>> {
         let mut st = self.db.prepare(&format!("{} WHERE i.pinned != 0", select(true))).map_err(e)?;
         let rows = st.query_map([], |r| Row::read(r, true)).map_err(e)?;
-        Ok(rows.filter_map(Result::ok).map(|r| (r.meta.id, index_part(r.haystack()).to_string(), r.meta.source.clone())).collect())
+        Ok(rows.filter_map(Result::ok).map(|r| (r.meta.id, r.haystack().to_string(), r.meta.source.clone())).collect())
     }
 
     /// Apply deletions made on another device. Items copied again after the
@@ -1343,7 +1381,7 @@ impl Store {
 
 fn fts_insert(tx: &Transaction, id: u64, text: &str, source: Option<&str>) -> R<()> {
     tx.prepare_cached("INSERT INTO fts(rowid, text, source) VALUES (?1, ?2, ?3)")
-        .and_then(|mut st| st.execute(params![id as i64, index_part(text), source.unwrap_or("")]))
+        .and_then(|mut st| st.execute(params![id as i64, text, source.unwrap_or("")]))
         .map(|_| ())
         .map_err(e)
 }
@@ -1364,6 +1402,10 @@ fn delete_rows(tx: &Transaction, ids: &[u64]) -> R<(u64, u64)> {
         }
     }
     Ok((n, ni))
+}
+
+fn get_info(db: &Connection, key: &str) -> R<Option<u64>> {
+    db.query_row("SELECT value FROM info WHERE key = ?1", [key], |r| r.get::<_, i64>(0)).optional().map(|v| v.map(|v| v as u64)).map_err(e)
 }
 
 fn set_counters(tx: &Transaction, total: u64, images: u64) -> R<()> {
@@ -1444,14 +1486,18 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
         if n.len() > h.len() {
             return false;
         }
+        if !n.iter().any(u8::is_ascii_alphabetic) {
+            return memchr::memmem::find(h, n).is_some();
+        }
         let first = n[0];
         let (lo, up) = (first.to_ascii_lowercase(), first.to_ascii_uppercase());
-        // jump between candidate first bytes (memchr-like), then compare
-        return h[..=h.len() - n.len()]
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| **b == lo || **b == up)
-            .any(|(i, _)| h[i..i + n.len()].eq_ignore_ascii_case(n));
+        // jump between candidate first bytes (SIMD), then compare
+        return memchr::memchr2_iter(lo, up, &h[..=h.len() - n.len()]).any(|i| h[i..i + n.len()].eq_ignore_ascii_case(n));
+    }
+    // no letters with case (CJK, digits, symbols): a plain search, without
+    // lowercasing a copy of the whole text (slow for megabytes)
+    if needle.chars().all(|c| !c.is_uppercase() && c.to_uppercase().eq(std::iter::once(c))) {
+        return hay.contains(needle);
     }
     hay.to_lowercase().contains(needle)
 }

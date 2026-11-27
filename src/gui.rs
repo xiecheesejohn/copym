@@ -928,7 +928,8 @@ impl App {
         }
     }
 
-    /// Split the list into sections: pinned, today, yesterday, this week, older.
+    /// Split the list into sections: pin groups (in a pin group), else today,
+    /// yesterday, this week, older.
     fn layout_list(&mut self) {
         let today = (now_secs() + self.tz).div_euclid(86_400);
         let mut lines = Vec::with_capacity(self.items.len() + 5);
@@ -936,8 +937,11 @@ impl App {
         let mut y = 4.0;
         let mut last = String::new();
         let several = self.groups.boards().nth(1).is_some();
+        // in a pin group pinned items get sections per group; elsewhere
+        // ("all") they sit at their place in time
+        let pin_group = self.groups.list.get(self.group).is_some_and(|g| g.pinned || g.board > 0);
         for (i, m) in self.items.iter().enumerate() {
-            let sec: String = if m.pinned {
+            let sec: String = if m.pinned && pin_group {
                 // one section per pin group when there are several
                 match self.groups.board_name(m.board).filter(|_| several) {
                     Some(name) => name.to_string(),
@@ -1416,15 +1420,14 @@ impl App {
         let mut make_default = None;
         // Close only on a click outside: a right click on a row opens its own
         // context menu ("设为默认分组") and must not close the list.
-        egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            for (i, g) in self.groups.list.iter().enumerate() {
-                let (row, hover) = ui.allocate_exact_size(Vec2::new(230.0, 28.0), Sense::click());
-                let fill = if i == self.group { pal.selected } else if hover.hovered() { pal.hover } else { Color32::TRANSPARENT };
-                let p = ui.painter();
-                p.rect_filled(row, 6, fill);
+        // rows: (label, right-hand text); the width fits the longest one
+        let rows: Vec<(String, String)> = self
+            .groups
+            .list
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
                 let label = if self.groups.default == g.name { tf!("{}  · 默认", "{}  · default", g.name) } else { g.name.clone() };
-                p.text(row.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(13.0), pal.text);
                 let mut right = match self.counts.get(i) {
                     Some(Some(n)) if self.counts_more && i > 0 => format!("{n}+"),
                     Some(Some(n)) => n.to_string(),
@@ -1434,6 +1437,25 @@ impl App {
                 if i < 9 {
                     right = format!("{right}   {KEY_GROUP}{}", i + 1);
                 }
+                (label, right)
+            })
+            .collect();
+        let (manage_label, manage_hint) = (t!("管理分组…", "manage groups…"), t!("右键：设为默认", "right click: make default"));
+        let text_w = |t: &str, size: f32| ui.painter().layout_no_wrap(t.to_string(), FontId::proportional(size), pal.text).size().x;
+        let row_w = rows
+            .iter()
+            .map(|(l, r)| text_w(l, 13.0) + text_w(r, 11.5))
+            .chain([text_w(manage_label, 13.0) + text_w(manage_hint, 11.0)])
+            .fold(0.0_f32, f32::max);
+        let row_w = (row_w + 44.0).max(230.0); // padding on both sides and a gap
+        egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for (i, (label, right)) in rows.into_iter().enumerate() {
+                let (row, hover) = ui.allocate_exact_size(Vec2::new(row_w, 28.0), Sense::click());
+                let fill = if i == self.group { pal.selected } else if hover.hovered() { pal.hover } else { Color32::TRANSPARENT };
+                let p = ui.painter();
+                p.rect_filled(row, 6, fill);
+                p.text(row.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(13.0), pal.text);
                 p.text(row.right_center() - Vec2::new(10.0, 0.0), Align2::RIGHT_CENTER, right, FontId::proportional(11.5), pal.faint);
                 if hover.clicked() {
                     chosen = Some(i);
@@ -1446,12 +1468,12 @@ impl App {
                 }
             }
             ui.separator();
-            let (row, hover) = ui.allocate_exact_size(Vec2::new(230.0, 28.0), Sense::click());
+            let (row, hover) = ui.allocate_exact_size(Vec2::new(row_w, 28.0), Sense::click());
             if hover.hovered() {
                 ui.painter().rect_filled(row, 6, pal.hover);
             }
-            ui.painter().text(row.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, t!("管理分组…", "manage groups…"), FontId::proportional(13.0), pal.text);
-            ui.painter().text(row.right_center() - Vec2::new(10.0, 0.0), Align2::RIGHT_CENTER, t!("右键：设为默认", "right click: make default"), FontId::proportional(11.0), pal.faint);
+            ui.painter().text(row.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, manage_label, FontId::proportional(13.0), pal.text);
+            ui.painter().text(row.right_center() - Vec2::new(10.0, 0.0), Align2::RIGHT_CENTER, manage_hint, FontId::proportional(11.0), pal.faint);
             if hover.clicked() {
                 manage = true;
                 ui.close();
@@ -2277,8 +2299,11 @@ impl App {
                     (crate::icons::REFRESH_CW, t!("重启 copym", "restart copym"), ":restart", &mut restart),
                     (crate::icons::LOG_OUT, t!("退出 copym", "quit copym"), ":q!", &mut quit),
                 ];
+                let text_w = |t: &str, size: f32| ui.painter().layout_no_wrap(t.to_string(), FontId::proportional(size), pal.text).size().x;
+                let row_w = entries.iter().map(|(_, l, k, _)| text_w(l, 13.0) + text_w(k, 11.5)).fold(0.0_f32, f32::max);
+                let row_w = (row_w + 32.0 + 10.0 + 24.0).max(200.0); // icon column, right padding, gap
                 for (icon, label, key, flag) in entries {
-                    let (row, resp) = ui.allocate_exact_size(Vec2::new(200.0, 28.0), Sense::click());
+                    let (row, resp) = ui.allocate_exact_size(Vec2::new(row_w, 28.0), Sense::click());
                     let p = ui.painter();
                     if resp.hovered() {
                         p.rect_filled(row, 6, pal.hover);
